@@ -164,6 +164,21 @@ def _gathered(rows_out, permuted):
     return rows_out[permuted.long()].float()
 
 
+def _assert_flashinfer_close(got, want, where=""):
+    """The pair's GEMM2 rows against FlashInfer's. On GB300 (same MMA order, SwiGLU and
+    quantization as the TRT-LLM-gen tactics) one BF16 ulp. On Rubin (sm_107) FlashInfer
+    runs other tactics: a few elements per million land a few ulps off (seen: at most 3
+    of 1.5M, all below 1e-4 absolute), so there the bound is on how many and how far."""
+    if torch.cuda.get_device_capability() != (10, 7):
+        torch.testing.assert_close(got, want, rtol=2**-7, atol=1e-6, msg=where or None)
+        return
+    off = int((~torch.isclose(got, want, rtol=2**-7, atol=1e-6)).sum())
+    assert off <= max(4, got.numel() // 100_000), (
+        f"{where}: {off} elements past one ulp"
+    )
+    torch.testing.assert_close(got, want, rtol=2**-5, atol=1e-4, msg=where or None)
+
+
 @pytest.fixture(scope="module")
 def target_layer():
     return _shuffled_layer(torch.Generator().manual_seed(2), TARGET_EXPERTS)
@@ -246,12 +261,8 @@ def _check_pair(layer, *, top_k, rows, distinct, graph, seed, max_rows, module=r
     rows_out, _, permuted = routed
     want_rows, want_permuted = _flashinfer(x_q, x_s, ids, weights, layer)
     torch.cuda.synchronize()
-    # Same MMA order, SwiGLU and quantization as the TRT-LLM-gen tactics; one BF16 ulp.
-    torch.testing.assert_close(
-        _gathered(rows_out, permuted),
-        _gathered(want_rows, want_permuted),
-        rtol=2**-7,
-        atol=1e-6,
+    _assert_flashinfer_close(
+        _gathered(rows_out, permuted), _gathered(want_rows, want_permuted)
     )
 
 
@@ -554,7 +565,7 @@ def _check_ep_halves(layer, *, top_k, rows, distinct, seed):
             full_rows[full_permuted.long()][local].view(torch.int16),
         ), where
         want = want_rows[want_permuted.clamp(min=0).long()][local]
-        torch.testing.assert_close(got.float(), want.float(), rtol=2**-7, atol=1e-6)
+        _assert_flashinfer_close(got.float(), want.float(), where)
         kept_total += local.int()
     assert torch.equal(kept_total, torch.ones_like(kept_total))
 
