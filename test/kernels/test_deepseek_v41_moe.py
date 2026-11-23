@@ -20,6 +20,11 @@
   all-experts gate's bit for bit.
 - The shared expert's gate_up on the low-latency GEMM at the TP8 shard (N 576), whose
   last 128-row tile is half full, against the TP4 shard's kernel on the same rows.
+- MoE TP8 on Rubin (TP8 without expert parallelism; sm107): the pair at the 288-wide
+  slice padded to 384 (the TP4 GEMMs' TP8 rewrites) against FlashInfer's routed MoE at
+  that width, target and DSpark draft, eager and replayed; slots gate_route and
+  gate_route_quant on that pair against its separate kernels bit for bit; the
+  640-only pipelined GEMM2 (slots gemm2_pipe, gemm2_reg_pool) declines at 384.
 """
 
 import ctypes
@@ -59,15 +64,17 @@ def _moe_ready() -> bool:
 needs_moe = pytest.mark.skipif(not _moe_ready(), reason="needs an SM100-family GPU")
 
 
-def _shuffled_layer(generator: torch.Generator, experts: int):
-    """Random MXFP4 expert weights, shuffled as Mxfp4FlashinferTrtllmMoEMethod does."""
+def _shuffled_layer(generator: torch.Generator, experts: int, shape=None):
+    """Random MXFP4 expert weights, shuffled as Mxfp4FlashinferTrtllmMoEMethod does;
+    ``shape`` (an ``ExpertShape``) sets the slice and its padding (default MoE TP4's)."""
     from flashinfer.fp4_quantization import block_scale_interleave
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
 
-    e, h, p, s = experts, reg.HIDDEN, reg.PADDED, reg.SLICE
+    e, h = experts, reg.HIDDEN
+    p, s = (shape.padded, shape.slice) if shape else (reg.PADDED, reg.SLICE)
     w13 = torch.randint(
         0, 256, (e, 2 * p, h // 2), dtype=torch.uint8, generator=generator
     )
@@ -143,7 +150,7 @@ def _flashinfer(x_q, x_s, ids, weights, layer):
         output2_scale_scalar=None,
         num_experts=experts,
         top_k=ids.size(1),
-        intermediate_size=reg.PADDED,
+        intermediate_size=2 * w2.size(-1),  # the padded width
         local_expert_offset=0,
         local_num_experts=experts,
         do_finalize=False,
@@ -191,7 +198,7 @@ def _flashinfer_ep(x_q, x_s, ids, weights, layer, *, num_experts, offset):
         output2_scale_scalar=None,
         num_experts=num_experts,
         top_k=ids.size(1),
-        intermediate_size=reg.PADDED,
+        intermediate_size=2 * w2.size(-1),  # the padded width
         local_expert_offset=offset,
         local_num_experts=w13.size(0),
         do_finalize=False,
@@ -209,12 +216,14 @@ def _ep_half(layer, ep_rank: int, ep: int = 2):
     return tuple(t[window].contiguous() for t in layer), ep_rank * local
 
 
-def _check_pair(layer, *, top_k, rows, distinct, graph, seed, max_rows):
+def _check_pair(layer, *, top_k, rows, distinct, graph, seed, max_rows, module=reg):
     from sglang.srt.layers.quantization.fp8_utils import flashinfer_mxfp8_quantize
 
     experts = layer[0].size(0)
     generator = torch.Generator().manual_seed(seed)
-    gemm = reg.RoutedExpertGemm(*layer, top_k=top_k, max_rows=max_rows, **GEMM2_OPTIONS)
+    gemm = module.RoutedExpertGemm(
+        *layer, top_k=top_k, max_rows=max_rows, **GEMM2_OPTIONS
+    )
     x = torch.randn(rows, reg.HIDDEN, generator=generator).to(torch.bfloat16).cuda()
     x_q, x_s = flashinfer_mxfp8_quantize(x, False, alignment=reg.HIDDEN)
     x_s = x_s.view(torch.float8_e4m3fn).reshape(rows, -1)
@@ -922,3 +931,112 @@ def test_gate_route_quant_refuses_what_it_does_not_serve(target_layer):
     plain = _gate_route_pair(half, route=False, quant=True, **common)
     assert plain.gate_route_quant_kernel is None
     assert not plain.serves_gate_route_quant(6)
+
+
+# --------------------------------------------- MoE TP8 on Rubin (TP8 without expert parallelism)
+
+needs_rubin_moe = pytest.mark.skipif(
+    not _moe_ready() or torch.cuda.get_device_capability() != (10, 7),
+    reason="needs a Rubin GPU (sm_107)",
+)
+
+
+def _rubin_reg():
+    from sgl_nvidia_mega.deepseek_v41.sm107.moe import routed_expert_gemm
+
+    return routed_expert_gemm
+
+
+@pytest.fixture(scope="module")
+def tp8_layers():
+    """The target's and the DSpark draft's experts at MoE TP8: the 288-wide slice of
+    moe_intermediate_size 2304, padded to 384."""
+    shape = _rubin_reg().EXPERT_SHAPES[384]
+    assert shape == (288, 384, 5)
+    return {
+        "target": _shuffled_layer(
+            torch.Generator().manual_seed(12), TARGET_EXPERTS, shape
+        ),
+        "draft": _shuffled_layer(
+            torch.Generator().manual_seed(13), DRAFT_EXPERTS, shape
+        ),
+    }
+
+
+TP8_CASES = {"target": (TARGET_TOP_K, (6, 384)), "draft": (DRAFT_TOP_K, (3, 128))}
+
+
+@needs_rubin_moe
+@pytest.mark.parametrize("which", ["target", "draft"])
+@pytest.mark.parametrize("rows", [1, 5, 6, 16, 48])
+@pytest.mark.parametrize("spread", [0, 1])  # every expert takes all rows / all experts
+@pytest.mark.parametrize("graph", [False, True])
+def test_moe_tp8_pair_matches_flashinfer(tp8_layers, which, rows, spread, graph):
+    rubin = _rubin_reg()
+    top_k, distincts = TP8_CASES[which]
+    _check_pair(
+        tp8_layers[which],
+        top_k=top_k,
+        rows=rows,
+        distinct=distincts[spread],
+        graph=graph,
+        seed=3900 + rows + 7 * spread,
+        max_rows=rubin.SERVED_MAX_ROWS,
+        module=rubin,
+    )
+
+
+@needs_rubin_moe
+@pytest.mark.parametrize("which, rows", [("target", 6), ("draft", 5)])
+@pytest.mark.parametrize("kind", ["normal", "one_expert"])
+def test_moe_tp8_gate_route_matches_separate_kernels(tp8_layers, which, rows, kind):
+    """Slots gate_route and gate_route_quant on the MoE TP8 pair against its separate
+    gate_topk + route kernels on SGLang's quant of the rows, bit for bit."""
+    rubin = _rubin_reg()
+    layer = tp8_layers[which]
+    top_k, router_experts = TP8_CASES[which][0], layer[0].size(0)
+    gen = torch.Generator(device="cuda").manual_seed(8000 + rows)
+    x = _routed_input("normal", rows, 8000 + rows)
+    logits = _gate_route_logits(kind, rows, router_experts, gen).contiguous()
+    bias = torch.randn(router_experts, device="cuda", generator=gen) * 0.05
+    x_q, x_s = _quantize_routed_input(x)
+
+    def pair(route, quant):
+        return rubin.RoutedExpertGemm(
+            *layer,
+            top_k=top_k,
+            max_rows=rubin.SERVED_MAX_ROWS,
+            gate_topk=True,
+            router_experts=router_experts,
+            gate_route=route,
+            gate_route_quant=quant,
+        )
+
+    separate, fused, quant = pair(False, False), pair(True, False), pair(True, True)
+    assert fused.gate_route_kernel is not None
+    assert quant.gate_route_quant_kernel is not None
+    for vision, padded, graph in GATE_ROUTE_VARIANTS:
+        num_valid, kw = _gate_args(rows, router_experts, gen, vision, padded)
+        args = (logits, bias, SCALE, num_valid)
+        want = _run_gate(separate, graph, x_q, x_s, *args, **kw)
+        where = f"{which} rows={rows} {kind} vision={vision} graph={graph}"
+        _assert_same_route(_run_gate(fused, graph, x_q, x_s, *args, **kw), want, where)
+        _assert_same_route(
+            _run_gate(quant, graph, None, None, *args, x=x, **kw), want, where
+        )
+
+
+@needs_rubin_moe
+def test_moe_tp8_declines_the_pipelined_gemm2(tp8_layers):
+    """gemm2_pipe.cu has the 640-wide intermediate only: at 384 the pair keeps the
+    default GEMM2, so slots gemm2_pipe and gemm2_reg_pool report unbuilt."""
+    rubin = _rubin_reg()
+    gemm = rubin.RoutedExpertGemm(
+        *tp8_layers["target"],
+        top_k=TARGET_TOP_K,
+        max_rows=rubin.SERVED_MAX_ROWS,
+        gemm2_pipe=True,
+        gemm2_registers=rubin.GEMM2_POOL_REGISTERS,
+    )
+    assert gemm.shape.padded == 384
+    assert gemm.gemm2_pipe is None and gemm.gemm2_registers == 0

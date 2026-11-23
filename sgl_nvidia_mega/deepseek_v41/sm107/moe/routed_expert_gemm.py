@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Low-batch routed-expert GEMMs for DeepSeek-V4.1 decode.
 
-A MoE layer at MoE TP4 (intermediate 576 padded to 640; all experts local, or under
-expert parallelism the rank's consecutive window of them) replaces FlashInfer's
+A MoE layer at MoE TP4 (intermediate 576 padded to 640) or MoE TP8 (288 padded to
+384: TP8 without expert parallelism; all experts local, or under expert parallelism the
+rank's consecutive window of them) replaces FlashInfer's
 TRT-LLM-gen routing + two batched GEMMs by a route kernel and a GEMM pair of 8-row
 tcgen05 block-scaled tiles (persistent schedule, PDL), compiled with NVRTC on first use. An expert chosen by more than 8 rows gets several
 consecutive tiles (route_wide.cu). The kernels read the same shuffled MXFP4 weights and
@@ -19,7 +20,7 @@ import ctypes
 import json
 from functools import cache
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -46,6 +47,24 @@ MAX_ROWS = 8
 WIDE_MAX_ROWS = 64  # route_wide.cu: one 64-bit row mask per expert
 GEMM1_UNITS = 9  # 128-row tiles of w13 holding the 576-wide slice (10th is padding)
 GEMM2_UNITS = HIDDEN // 128
+
+
+class ExpertShape(NamedTuple):
+    """One rank's routed-expert widths: the real intermediate slice, FlashInfer's
+    padding of it to a multiple of 128 (gate and up each), and the 128-row w13 tiles
+    that hold real rows."""
+
+    slice: int
+    padded: int
+    gemm1_units: int
+
+
+# Keyed by the padded width: MoE TP4 (2304 / 4) and MoE TP8 (2304 / 8). The TP8 GEMMs
+# are the TP4 sources rewritten by _tp8_gemm1_source / _tp8_gemm2_source.
+EXPERT_SHAPES = {
+    PADDED: ExpertShape(SLICE, PADDED, GEMM1_UNITS),
+    384: ExpertShape(288, 384, 5),
+}
 ROUTE_THREADS = 64
 ROUTE_WIDE_THREADS = 512
 NVRTC_OPTIONS = ("-std=c++17", "-default-device", "--use_fast_math")
@@ -120,9 +139,79 @@ def route_words(ctas: int) -> int:
     return 4 + 2 * cta_words(ctas) + TILE * ctas
 
 
+def _replace(source: str, old: str, new: str, count: int) -> str:
+    if source.count(old) != count:
+        raise RuntimeError(
+            f"TP8 rewrite: expected {count} x {old!r}, found {source.count(old)}"
+        )
+    return source.replace(old, new)
+
+
+def _tp8_gemm1_source(source: str) -> str:
+    """gemm1.cu for a 288-wide slice padded to 384 (5 real w13 tiles of the expert's 6)."""
+    for old, new, count in (
+        ("* 640 + 576 +", "* 384 + 320 +", 2),  # h padding columns 320..383
+        ("* 640 + m_tile * 64", "* 384 + m_tile * 64", 2),  # h row stride
+        ("n_tile * 160 +", "n_tile * 96 +", 2),  # h scales: 8 rows x 12 blocks a tile
+        ("if (m_tile == 8) {", "if (m_tile == 4) {", 1),  # the last real tile pads
+        ("int pad_block = 18 + thread % 2;", "int pad_block = 10 + thread % 2;", 1),
+        ("route[4 + n_tile_5] * 10)", "route[4 + n_tile_5] * 6)", 1),  # w13 scale tiles
+    ):
+        source = _replace(source, old, new, count)
+    return source
+
+
+def _tp8_gemm2_source(source: str) -> str:
+    """gemm2.cu for K = 384: each unit takes a full 256 stage and the half (128) stage,
+    so every role (the stage_N counters and the SFB-to-TMEM warps' ``stage``) drops
+    its middle block."""
+    lines = source.split("\n")
+    cuts = []
+    for counter in (
+        "stage",
+        "stage_1",
+        "stage_2",
+        "stage_3",
+        "stage_4",
+        "stage_5",
+        "stage_6",
+    ):
+        wraps = [i for i, line in enumerate(lines) if f"if ({counter} == 5) {{" in line]
+        if len(wraps) != 3:
+            raise RuntimeError(
+                f"TP8 rewrite: expected 3 stage blocks for {counter}, found {len(wraps)}"
+            )
+        cuts.append((wraps[0] + 1, wraps[1] + 1))
+    for start, end in sorted(cuts, reverse=True):
+        del lines[start:end]
+    source = "\n".join(lines)
+    for old, new, count in (
+        ("* 640 + 512 +", "* 384 + 256 +", 1),  # h: the half stage reads K 256..383
+        ("* 640 +", "* 384 +", 2),
+        ("n_tile_3 * 160 + 128 +", "n_tile_3 * 96 + 64 +", 1),  # h scales
+        ("n_tile_3 * 160 +", "n_tile_3 * 96 +", 1),
+        ("(row_tile * 5 + 4) * 2", "(row_tile * 3 + 2) * 2", 1),  # w2 scales: 3 units
+        ("row_tile * 5", "row_tile * 3", 2),
+        (
+            '"r"(m_tile_4 * 128), "r"(4)',
+            '"r"(m_tile_4 * 128), "r"(2)',
+            1,
+        ),  # half stage K
+    ):
+        source = _replace(source, old, new, count)
+    return source
+
+
+# The GEMMs rewritten for MoE TP8's 384-wide padded intermediate
+_TP8_SOURCES = {"gemm1": _tp8_gemm1_source, "gemm2": _tp8_gemm2_source}
+
+
 @cache
-def load_kernels(device_index: int) -> dict[str, _Kernel]:
-    """Compile (or read from the cache) and load the route kernel and GEMMs."""
+def load_kernels(device_index: int, padded: int = PADDED) -> dict[str, _Kernel]:
+    """Compile (or read from the cache) and load the route kernel and GEMMs for one
+    padded intermediate width (``EXPERT_SHAPES``)."""
+    if padded not in EXPERT_SHAPES:
+        raise ValueError(f"no routed GEMMs for a {padded}-wide intermediate")
     device = torch.device("cuda", device_index)
     with torch.cuda.device(device):
         torch.zeros(1, device=device)  # make the primary context current
@@ -150,9 +239,11 @@ def load_kernels(device_index: int) -> dict[str, _Kernel]:
                 raise RuntimeError(
                     f"{name}: unexpected launch.json parameters {fact['parameters']}"
                 )
-            source = (SOURCE_DIR / f"{name}.cu").read_text()
+            source, program = (SOURCE_DIR / f"{name}.cu").read_text(), name
+            if padded != PADDED:
+                source, program = _TP8_SOURCES[name](source), f"{name}_p{padded}"
             kernels[name] = _load(
-                compile_source(source, name, arch),
+                compile_source(source, program, arch),
                 fact["symbol"],
                 fact["block"],
                 int(fact["shared_memory_bytes"]),
@@ -466,7 +557,8 @@ def _scale_map(scales: torch.Tensor, groups: int):
 
 
 def _activation_map(values: torch.Tensor):
-    """TMA map of the MXFP8 intermediate ``[rows, 640]`` (u8) as {640, rows}, box
+    """TMA map of the MXFP8 intermediate ``[rows, 640]`` (u8) as {640, rows} (gemm2_pipe:
+    the 640-wide intermediate only), box
     {128, 8}, 128-byte swizzle: one load lands one 128-K chunk of one 8-row tile as the
     K-major atom gemm2.cu's cp.async path writes (muLLM's activation map)."""
     cu = _driver()
@@ -478,8 +570,8 @@ def _activation_map(values: torch.Tensor):
             cu.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8,
             2,
             values.data_ptr(),
-            [u64(PADDED), u64(values.size(0))],
-            [u64(PADDED)],
+            [u64(values.size(1)), u64(values.size(0))],
+            [u64(values.size(1))],
             [u32(128), u32(TILE)],
             [u32(1)] * 2,
             cu.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
@@ -492,23 +584,31 @@ def _activation_map(values: torch.Tensor):
     return tensor_map
 
 
-def check_weights(w13, w13_scale, w2, w2_scale, clamp, top_k: int) -> None:
-    """Raise ValueError unless the weights have the layout the kernels read."""
+def check_weights(w13, w13_scale, w2, w2_scale, clamp, top_k: int) -> ExpertShape:
+    """The weights' ``ExpertShape``; raise ValueError unless they have the layout the
+    kernels read."""
     experts = w13.size(0)
+    shape = EXPERT_SHAPES.get(2 * w2.size(-1)) if w2.dim() == 3 else None
+    if shape is None:
+        raise ValueError(
+            f"expected a padded intermediate of {sorted(EXPERT_SHAPES)}, got w2 "
+            f"{tuple(w2.shape)}"
+        )
+    padded = shape.padded
     expected = (
-        (w13, (experts, 2 * PADDED, HIDDEN // 2)),
-        (w13_scale, (experts, 2 * PADDED, HIDDEN // 32)),
-        (w2, (experts, HIDDEN, PADDED // 2)),
-        (w2_scale, (experts, HIDDEN, PADDED // 32)),
+        (w13, (experts, 2 * padded, HIDDEN // 2)),
+        (w13_scale, (experts, 2 * padded, HIDDEN // 32)),
+        (w2, (experts, HIDDEN, padded // 2)),
+        (w2_scale, (experts, HIDDEN, padded // 32)),
     )
-    for tensor, shape in expected:
+    for tensor, want in expected:
         if (
-            tuple(tensor.shape) != shape
+            tuple(tensor.shape) != want
             or tensor.element_size() != 1
             or not tensor.is_contiguous()
         ):
             raise ValueError(
-                f"expected a contiguous {shape} 1-byte tensor, got {tuple(tensor.shape)} {tensor.dtype}"
+                f"expected a contiguous {want} 1-byte tensor, got {tuple(tensor.shape)} {tensor.dtype}"
             )
     if experts % 32 or not 0 < experts <= MAX_EXPERTS:
         raise ValueError(
@@ -522,13 +622,14 @@ def check_weights(w13, w13_scale, w2, w2_scale, clamp, top_k: int) -> None:
         or tuple(clamp.shape) != (experts,)
     ):
         raise ValueError("expected an FP32 [E] SwiGLU clamp limit")
-    # GEMM1 never reads w13's padding tile, so the padding must be zero, as must the
-    # matching K columns of w2.
+    # GEMM1 never reads w13's padding tiles (past the gemm1_units that hold real rows),
+    # so they must be zero, as must w2's K columns past the slice.
     if (
-        torch.count_nonzero(w13.view(torch.uint8)[:, 2 * SLICE :]).item()
-        or torch.count_nonzero(w2.view(torch.uint8)[:, :, SLICE // 2 :]).item()
+        torch.count_nonzero(w13.view(torch.uint8)[:, 128 * shape.gemm1_units :]).item()
+        or torch.count_nonzero(w2.view(torch.uint8)[:, :, shape.slice // 2 :]).item()
     ):
         raise ValueError("the intermediate padding of w13/w2 is not zero")
+    return shape
 
 
 class RoutedExpertGemm:
@@ -564,7 +665,7 @@ class RoutedExpertGemm:
         gemm2_pipe), at ``gemm2_registers`` per thread when > 0 (the register pool)."""
         w13, w13_scale = w13.view(torch.uint8), w13_scale.view(torch.uint8)
         w2, w2_scale = w2.view(torch.uint8), w2_scale.view(torch.uint8)
-        check_weights(w13, w13_scale, w2, w2_scale, clamp, top_k)
+        self.shape = check_weights(w13, w13_scale, w2, w2_scale, clamp, top_k)
         if not MAX_ROWS <= max_rows <= WIDE_MAX_ROWS:
             raise ValueError(
                 f"max_rows {max_rows} is outside {MAX_ROWS}-{WIDE_MAX_ROWS}"
@@ -600,7 +701,7 @@ class RoutedExpertGemm:
         )
         self.top_k = top_k
         self.max_rows = max_rows
-        self.kernels = load_kernels(w13.device.index)
+        self.kernels = load_kernels(w13.device.index, self.shape.padded)
         self.route_wide = (
             load_route_wide(w13.device.index) if max_rows > MAX_ROWS else None
         )
@@ -641,13 +742,17 @@ class RoutedExpertGemm:
             clamp,
         )  # the maps hold their addresses
         self.clamp = clamp
+        padded = self.shape.padded
         self.gemm1_maps = (
-            _weight_map(w13, 2 * PADDED, HIDDEN, 2),
+            _weight_map(w13, 2 * padded, HIDDEN, 2),
             _scale_map(w13_scale, 4),
         )
-        self.gemm2_maps = (_weight_map(w2, HIDDEN, PADDED, 2), _scale_map(w2_scale, 1))
+        self.gemm2_maps = (_weight_map(w2, HIDDEN, padded, 2), _scale_map(w2_scale, 1))
         if gemm2_registers and not gemm2_pipe:
             raise ValueError("the GEMM2 register pool is a build of the pipeline GEMM2")
+        # gemm2_pipe.cu has the 640-wide intermediate only: at MoE TP8 GEMM2 stays the
+        # default build (slots gemm2_pipe / gemm2_reg_pool then report unbuilt)
+        gemm2_pipe = gemm2_pipe and padded == PADDED
         # slot gemm2_reg_pool: the cap this layer's GEMM2 was built at (0: none)
         self.gemm2_registers = int(gemm2_registers) if gemm2_pipe else 0
         self.gemm2_pipe = (
@@ -660,7 +765,7 @@ class RoutedExpertGemm:
         """(GEMM1 kernel, grid), (GEMM2 kernel, grid) for ``ctas`` token tiles; fixed
         by the call's shape, never by its routes, so one graph keeps one kernel."""
         return (
-            (self.kernels["gemm1"], (GEMM1_UNITS, ctas, 1)),
+            (self.kernels["gemm1"], (self.shape.gemm1_units, ctas, 1)),
             (self.gemm2_pipe or self.kernels["gemm2"], (GEMM2_UNITS, ctas, 1)),
         )
 
@@ -742,9 +847,11 @@ class RoutedExpertGemm:
                 stream,
             )
         padded_rows = TILE * ctas
-        h_values = torch.empty((padded_rows, PADDED), dtype=torch.uint8, device=device)
+        h_values = torch.empty(
+            (padded_rows, self.shape.padded), dtype=torch.uint8, device=device
+        )
         h_scales = torch.empty(
-            (padded_rows + 127) // 128 * 128 * PADDED // 32,
+            (padded_rows + 127) // 128 * 128 * self.shape.padded // 32,
             dtype=torch.uint8,
             device=device,
         )
@@ -967,9 +1074,11 @@ class RoutedExpertGemm:
         stream = torch.cuda.current_stream(device).cuda_stream
         rows = x_quant.size(0)
         padded_rows = TILE * ctas
-        h_values = torch.empty((padded_rows, PADDED), dtype=torch.uint8, device=device)
+        h_values = torch.empty(
+            (padded_rows, self.shape.padded), dtype=torch.uint8, device=device
+        )
         h_scales = torch.empty(
-            (padded_rows + 127) // 128 * 128 * PADDED // 32,
+            (padded_rows + 127) // 128 * 128 * self.shape.padded // 32,
             dtype=torch.uint8,
             device=device,
         )

@@ -73,6 +73,7 @@ def _refusal(hf=None, dtype="bfloat16", isa="sm_103", env=None, **args) -> str:
         contextlib.ExitStack() as stack,
         patch.object(guards, "plugin_reasons", return_value=[]),
         patch.object(guards, "device_isa", return_value=isa),
+        patch.object(arch, "_chosen", None),  # the directory follows this call's ISA
         patch.object(guards, "model_config_of") as model_config,
         patch.object(spec, "flashinfer_ll_gemm_digest", return_value=None),
         patch.object(spec.importlib.util, "find_spec", return_value=object()),
