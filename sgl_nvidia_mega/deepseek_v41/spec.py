@@ -42,6 +42,7 @@ SGLANG_READS = {
         "SPECULATIVE_DECODING",
         "MULTI_NODE_TP",
         "EXPERT_PARALLEL",
+        "PD_DISAGGREGATION",
         "MegakernelSpec",
         "Numerics",
         "NumericsKind",
@@ -69,6 +70,7 @@ SGLANG_READS = {
         "init_expert_location",
         "ep_dispatch_algorithm",
         "ep_join_mode",
+        "disaggregation_mode",
     ),
     "srt/environ.py": ("SGLANG_SHARED_EXPERT_TP1",),
 }
@@ -118,8 +120,8 @@ def decode_graph_backends() -> frozenset:
 
 def resident_blocks() -> int:
     """GB300's 152 SMs, within which the GEMM pair's persistent schedule and the
-    Lamport consumer stay; with "sm148" listed, a B300's 148: no DeepSeek-V4.1 kernel
-    pins a 152-CTA grid."""
+    Lamport consumer stay (Rubin has more); with "sm148" listed, a B300's 148: no
+    DeepSeek-V4.1 kernel pins a 152-CTA grid."""
     return 148 if "sm148" in SLOTS else 152
 
 
@@ -168,8 +170,22 @@ def engram_reasons(cfg) -> list[str]:
     ]
 
 
+def pd_reasons(cfg) -> list[str]:
+    """PD disaggregation is served at the decode role: the KV arrives through the
+    transfer backend into pool slots before a request's first verify step, outside
+    the covered step. The prefill role runs no covered step."""
+    mode = getattr(cfg, "disaggregation_mode", None) or "null"
+    if mode in ("null", "decode"):
+        return []
+    return [
+        f"PD disaggregation ({mode} role): DeepSeek-V4.1 serves the decode role; run "
+        "the prefill server without --enable-nvidia-megakernel"
+    ]
+
+
 REQUIREMENTS = Requirements(
-    isas=frozenset({"sm_103"}),
+    # B300 / GB300 (sm103/) and Rubin (sm107/): arch.directory() picks the kernels
+    isas=frozenset({"sm_103", "sm_107"}),
     tp_sizes=frozenset(tp for tp, _ in TOPOLOGIES),
     resident_blocks=resident_blocks(),
     dtypes=frozenset({"bfloat16"}),
@@ -337,6 +353,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
 
     reasons = (
         topology_reasons(cfg)
+        + pd_reasons(cfg)
         + engram_reasons(cfg)
         + toolchain_reasons()
         + runtime.slot_reasons()
@@ -370,6 +387,8 @@ SPEC = MegakernelSpec(
             Feature.SPECULATIVE_DECODING,
             Feature.MULTI_NODE_TP,
             Feature.EXPERT_PARALLEL,
+            # the decode role of a PD-disaggregated deployment (pd_reasons)
+            Feature.PD_DISAGGREGATION,
         }
     ),
     numerics=NUMERICS,

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 
+from sgl_nvidia_mega.deepseek_v41 import arch
 from sgl_nvidia_mega.deepseek_v41.moe import routed
 from sgl_nvidia_mega.deepseek_v41.moe.step import step
 
@@ -22,9 +23,9 @@ logger = logging.getLogger(__name__)
 def gemm2_options(slots) -> dict:
     """The routed GEMM2 build the slots ask for (slot gemm2_pipe; slot gemm2_reg_pool:
     that build capped at GEMM2_POOL_REGISTERS per thread)."""
-    from sgl_nvidia_mega.deepseek_v41.sm103.moe.routed_expert_gemm import (
-        GEMM2_POOL_REGISTERS,
-    )
+    GEMM2_POOL_REGISTERS = arch.kernel_module(
+        "moe.routed_expert_gemm"
+    ).GEMM2_POOL_REGISTERS
 
     pipe = "gemm2_pipe" in slots
     registers = GEMM2_POOL_REGISTERS if pipe and "gemm2_reg_pool" in slots else 0
@@ -33,9 +34,7 @@ def gemm2_options(slots) -> dict:
 
 def gemm2_pool_summary(bound: routed.Bound) -> str:
     """The register-pool GEMM2 as built: its cap, registers and spill bytes per thread."""
-    from sgl_nvidia_mega.deepseek_v41.sm103.moe.routed_expert_gemm import (
-        kernel_registers,
-    )
+    kernel_registers = arch.kernel_module("moe.routed_expert_gemm").kernel_registers
 
     gemms = [s.gemm for s in bound.slots.values() if s.gemm.gemm2_registers]
     if not gemms:
@@ -51,7 +50,8 @@ def build(model, ctx, group) -> routed.Bound:
     """The routed-expert GEMM pair of every MoE layer (slot ``moe``; slot ``gate``:
     its fast top-k); the result is ``st.bound["moe"]``."""
     from sgl_nvidia_mega.deepseek_v41.runtime import SLOTS
-    from sgl_nvidia_mega.deepseek_v41.sm103.moe.router_mma import gate_route_release
+
+    gate_route_release = arch.kernel_module("moe.router_mma").gate_route_release
 
     if "moe" not in SLOTS:
         return routed.Bound(reason="stock (SGLANG_NVIDIA_MEGAKERNEL_SLOTS)")

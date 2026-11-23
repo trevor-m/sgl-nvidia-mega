@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import arch
+
 # The SGLang names this module reads, by file under the sglang package;
 # test/unit/test_contract.py pins them.
 SGLANG_READS = {
@@ -106,7 +108,7 @@ def build_fused(subs, device, group) -> str:
     ``subs`` (HcSubLayers) and check it against the pair, bit for bit, at every row
     count on each sublayer's weights. "" when served, else why not (alike on every
     rank: each rank's verdict is gathered)."""
-    from sgl_nvidia_mega.deepseek_v41.sm103.hc_coeff import HcCoeff
+    HcCoeff = arch.kernel_module("hc_coeff").HcCoeff
 
     kernels, error = {}, ""
     try:

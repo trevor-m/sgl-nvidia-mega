@@ -18,6 +18,8 @@ from typing import Optional
 
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import arch
+
 logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -127,7 +129,7 @@ def _mailbox(
     max_rows: int,
     final_collapse: bool = False,
 ):
-    from sgl_nvidia_mega.deepseek_v41.sm103 import all_reduce_mhc
+    all_reduce_mhc = arch.kernels("all_reduce_mhc")
 
     # before the consumer compiles: the deadline is a constant of its kernel
     all_reduce_mhc.set_wait_deadline(deadline_s)

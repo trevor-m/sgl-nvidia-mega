@@ -15,8 +15,10 @@ from typing import Any
 
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import arch
 from sgl_nvidia_mega.deepseek_v41.attention import chain, ops, prepare
-from sgl_nvidia_mega.deepseek_v41.sm103.attention import core_lean as core_lean_kernel
+
+core_lean_kernel = arch.kernels("attention.core_lean")
 
 # The SGLang names this package reads, by file under the sglang package (``f(p)``: a
 # parameter); test/unit/test_contract.py pins them.
@@ -400,6 +402,6 @@ class AttentionStep:
 def _publish_row_tiles(rows: int, publish) -> bool:
     """Whether wo_a writes row-tile scales: hop A's publishing wo_b reads them past 8
     rows (SGLang's wo_b, its fallback, cannot: ``ops.wo_b`` refuses them)."""
-    from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+    mxfp8_ll = arch.kernels("mxfp8_ll")
 
     return publish is not None and rows > mxfp8_ll.MAX_ROWS

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import arch
+
 # The SGLang names this module reads, by file under the sglang package;
 # test/unit/test_contract.py pins them.
 SGLANG_READS = {
@@ -97,7 +99,7 @@ def index_q_input(attn, q_lora, q_for_wqb):
 
 def qkv_a(attn, x):
     """``MQALayer``'s fused ``wqkv_a(x)``: [rows, q_lora_rank + head_dim]."""
-    from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+    mxfp8_ll = arch.kernels("mxfp8_ll")
 
     if isinstance(x, mxfp8_ll.RowTileMxfp8):
         # row-tile scales are not a layout SGLang's wqkv_a reads: never a silent fallback
@@ -246,7 +248,7 @@ def wo_b(attn, o, publish=None):
     from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
     from sglang.srt.models import deepseek_v4_mhc as mhc
 
-    from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+    mxfp8_ll = arch.kernels("mxfp8_ll")
 
     if publish is not None:
         partial = publish(attn.wo_b, o.flatten(1) if isinstance(o, torch.Tensor) else o)

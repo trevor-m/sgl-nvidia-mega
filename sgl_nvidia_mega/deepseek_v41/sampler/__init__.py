@@ -23,6 +23,8 @@ from typing import Callable, Optional
 
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import arch
+
 logger = logging.getLogger(__name__)
 
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
@@ -73,7 +75,7 @@ LM_HEAD_BACKEND = "cute-dsl"
 
 def disable_reason(lm, *, gamma: int, world: int, rank: int) -> str:
     """Why the chain cannot serve this draft, or ""; the same on every rank."""
-    from sgl_nvidia_mega.deepseek_v41.sm103 import markov
+    markov = arch.kernels("markov")
 
     head, lm_head = lm.markov_head, lm.lm_head
     if lm_head is None:
@@ -147,7 +149,7 @@ class DraftLmHead:
         return self.low_m and rows <= LM_HEAD_MAX_ROWS
 
     def streams(self, rows: int) -> bool:
-        from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+        lm_head_mxfp8 = arch.kernels("lm_head_mxfp8")
 
         return self.mxfp8 is not None and rows <= lm_head_mxfp8.MAX_ROWS
 
@@ -160,7 +162,7 @@ class DraftLmHead:
         """Tune the low-M kernel at the row counts the draft runs (compile the MXFP8
         stream's); the same calls on every rank, before any graph is captured."""
         if self.mxfp8 is not None:
-            from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+            lm_head_mxfp8 = arch.kernels("lm_head_mxfp8")
 
             lm_head_mxfp8.precompile(*self.mxfp8.shape, self.lm_head.weight.device)
         if self.pinned:
@@ -179,7 +181,7 @@ class DraftLmHead:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if self.streams(x.shape[0]):
-            from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+            lm_head_mxfp8 = arch.kernels("lm_head_mxfp8")
 
             return lm_head_mxfp8.matmul(x.contiguous(), self.mxfp8)
         if not self.takes(x.shape[0]):
@@ -219,7 +221,7 @@ def build_steps(
     when the ranks would serve different sizes (their graphs would wait on each other)."""
     from sglang.srt.runtime_context import get_parallel
 
-    from sgl_nvidia_mega.deepseek_v41.sm103 import markov
+    markov = arch.kernels("markov")
 
     group = get_parallel().tp_group
     world, rank = group.world_size, group.rank_in_group
@@ -321,7 +323,8 @@ def draft_mxfp8_copy(weight: torch.Tensor, slots):
     if "draft_lm_head_mxfp8" not in slots:
         return None
     from sgl_nvidia_mega.deepseek_v41.logits import mxfp8_copy
-    from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+
+    lm_head_mxfp8 = arch.kernels("lm_head_mxfp8")
 
     reason = lm_head_mxfp8.unsupported_reason(weight)
     copy = None if reason else mxfp8_copy(weight)

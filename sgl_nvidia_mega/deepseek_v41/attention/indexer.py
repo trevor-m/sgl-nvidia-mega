@@ -46,8 +46,11 @@ from typing import NamedTuple, Optional
 
 import torch
 
-from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
-from sgl_nvidia_mega.deepseek_v41.sm103.attention import paged_logits_q6, reindex_select
+from sgl_nvidia_mega.deepseek_v41 import arch
+
+mxfp8_ll = arch.kernels("mxfp8_ll")
+paged_logits_q6 = arch.kernels("attention.paged_logits_q6")
+reindex_select = arch.kernels("attention.reindex_select")
 
 logger = logging.getLogger(__name__)
 

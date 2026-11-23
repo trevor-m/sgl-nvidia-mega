@@ -33,7 +33,9 @@ from typing import Optional
 import msgspec
 import torch
 
-from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+from sgl_nvidia_mega.deepseek_v41 import arch
+
+mxfp8_ll = arch.kernels("mxfp8_ll")
 
 logger = logging.getLogger(__name__)
 
@@ -561,7 +563,7 @@ class Boundaries:
         """Hop B: the Lamport MoE finalize on ``hop`` (hop A's mailbox, or the
         draft's); the next input as SGLang's post builds it at these widths: MXFP8 for
         an MXFP8 receiver whose norm folds, else the streams only."""
-        from sgl_nvidia_mega.deepseek_v41.sm103.all_reduce_mhc import mxfp8_scale_bytes
+        mxfp8_scale_bytes = arch.kernel_module("all_reduce_mhc").mxfp8_scale_bytes
 
         self._log_served(
             "hop B MoE post" if hop is self.hop_a else "draft hop MoE post",

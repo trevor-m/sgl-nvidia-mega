@@ -1,0 +1,1000 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Low-batch routed-expert GEMMs for DeepSeek-V4.1 decode.
+
+A MoE layer at MoE TP4 (intermediate 576 padded to 640; all experts local, or under
+expert parallelism the rank's consecutive window of them) replaces FlashInfer's
+TRT-LLM-gen routing + two batched GEMMs by a route kernel and a GEMM pair of 8-row
+tcgen05 block-scaled tiles (persistent schedule, PDL), compiled with NVRTC on first use. An expert chosen by more than 8 rows gets several
+consecutive tiles (route_wide.cu). The kernels read the same shuffled MXFP4 weights and
+MXFP8 activations as FlashInfer and return its deferred-finalize triple, so the fused
+finalize + all-reduce + mHC consumer is unchanged. On the target and DSpark draft
+routers, gate_topk.cu / gate_topk_draft.cu run the router's top-k ahead of the route
+kernel.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import json
+from functools import cache
+from pathlib import Path
+from typing import Optional
+
+import torch
+
+from sgl_nvidia_mega.common.jit import Kernel as _Kernel
+from sgl_nvidia_mega.common.jit import check as _check
+from sgl_nvidia_mega.common.jit import compile_source as _compile_source
+from sgl_nvidia_mega.common.jit import driver as _driver
+from sgl_nvidia_mega.common.jit import launch as _launch
+from sgl_nvidia_mega.common.jit import load as _load
+from sgl_nvidia_mega.common.jit import null_or_pointer as _null_or_pointer
+from sgl_nvidia_mega.common.jit import pointer as _pointer
+
+SOURCE_DIR = Path(__file__).resolve().parent / "src"
+
+HIDDEN = 5120
+SLICE = 576
+PADDED = 640
+MAX_EXPERTS = 384
+# slot moe_balanced: expert-parallel groups the route kernels deal a step's experts over
+DEAL_GROUPS = 2
+MAX_TOP_K = 8
+TILE = 8
+MAX_ROWS = 8
+WIDE_MAX_ROWS = 64  # route_wide.cu: one 64-bit row mask per expert
+GEMM1_UNITS = 9  # 128-row tiles of w13 holding the 576-wide slice (10th is padding)
+GEMM2_UNITS = HIDDEN // 128
+ROUTE_THREADS = 64
+ROUTE_WIDE_THREADS = 512
+NVRTC_OPTIONS = ("-std=c++17", "-default-device", "--use_fast_math")
+HEADERS = ("route.cuh",)
+GEMM1_PARAMETERS = ("A", "SFA", "X", "XS", "route", "clamp", "H", "HS", "cta_words")
+GEMM2_PARAMETERS = ("A", "SFA", "H", "HS", "route", "Y", "cta_words")
+PARAMETERS = {
+    "gemm1": GEMM1_PARAMETERS,
+    "gemm2": GEMM2_PARAMETERS,
+    "gemm2_pipe": GEMM2_PARAMETERS,  # H as a TMA tensor map (launch.json tensor_maps)
+}
+# Slot gemm2_pipe (opt-in): GEMM2 as muLLM's reference-pipeline + prelude build of the
+# same kernel (gemm2_pipe.cu), bit for bit
+# the default GEMM2's. ``gemm2_registers`` (slot gemm2_reg_pool): that build at
+# GEMM2_POOL_REGISTERS registers per thread (__maxnreg__; muLLM's register pool), so a
+# CTA holds 48 K of the SM's 64 K registers and a dependent's CTA can land beside it.
+# Bitwise: the same code with fewer registers and no spill. The kernel's setmaxnreg split
+# (4 warps up to 192, 12 down to 48) needs 84 per thread on average; under that the
+# epilogue's increase never completes.
+GEMM2_POOL_REGISTERS = 96
+
+
+def kernel_registers(kernel: _Kernel) -> tuple[int, int]:
+    """(registers per thread, local memory bytes per thread: spills) of a loaded kernel."""
+    cu = _driver()
+    attr = cu.CUfunction_attribute
+    (regs,) = _check(
+        cu.cuFuncGetAttribute(attr.CU_FUNC_ATTRIBUTE_NUM_REGS, kernel.function),
+        "cuFuncGetAttribute(NUM_REGS)",
+    )
+    (local,) = _check(
+        cu.cuFuncGetAttribute(attr.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES, kernel.function),
+        "cuFuncGetAttribute(LOCAL_SIZE_BYTES)",
+    )
+    return int(regs), int(local)
+
+
+def compile_source(source, name, arch, options=NVRTC_OPTIONS, headers=None) -> bytes:
+    return _compile_source(source, name, arch, options, headers)
+
+
+# The rows the forward routes through the pair; larger steps keep FlashInfer
+SERVED_MAX_ROWS = 48
+# gate_topk.cuh specialized per router (experts, top_k), one NVRTC program and symbol
+# each: the DSV4.1 target's and the DSpark draft's.
+GATE_TOPK_EXPERTS = 384
+GATE_TOPK_TOP_K = 6
+DRAFT_GATE_TOPK_EXPERTS = 128
+DRAFT_GATE_TOPK_TOP_K = 3
+GATE_TOPK_VARIANTS = {
+    (GATE_TOPK_EXPERTS, GATE_TOPK_TOP_K): ("gate_topk", "dsv41_gate_topk"),
+    (DRAFT_GATE_TOPK_EXPERTS, DRAFT_GATE_TOPK_TOP_K): (
+        "gate_topk_draft",
+        "dsv41_gate_topk_e128_k3",
+    ),
+}
+
+
+def max_ctas(rows: int, top_k: int, experts: int) -> int:
+    """The most 8-row token tiles any routing of ``rows * top_k`` slots needs."""
+    slots = rows * top_k
+    filled = min(experts, slots)
+    return filled + (slots - filled) // TILE
+
+
+def cta_words(ctas: int) -> int:
+    return (ctas + 3) // 4 * 4
+
+
+def route_words(ctas: int) -> int:
+    """int32 length of the route record for ``ctas`` token tiles."""
+    return 4 + 2 * cta_words(ctas) + TILE * ctas
+
+
+@cache
+def load_kernels(device_index: int) -> dict[str, _Kernel]:
+    """Compile (or read from the cache) and load the route kernel and GEMMs."""
+    device = torch.device("cuda", device_index)
+    with torch.cuda.device(device):
+        torch.zeros(1, device=device)  # make the primary context current
+        major, minor = torch.cuda.get_device_capability(device)
+        arch = f"sm_{major}{minor}a"
+        facts = json.loads((SOURCE_DIR / "launch.json").read_text())
+        headers = {name: (SOURCE_DIR / name).read_text() for name in HEADERS}
+        kernels = {
+            "route": _load(
+                compile_source(
+                    (SOURCE_DIR / "route.cu").read_text(),
+                    "route",
+                    arch,
+                    headers=headers,
+                ),
+                "dsv41_routed_expert_route",
+                (ROUTE_THREADS, 1, 1),
+                0,
+            )
+        }
+        for name, fact in facts.items():
+            if fact.get("opt_in"):
+                continue  # built on request (load_gemm2_pipe)
+            if tuple(fact["parameters"]) != PARAMETERS.get(name):
+                raise RuntimeError(
+                    f"{name}: unexpected launch.json parameters {fact['parameters']}"
+                )
+            source = (SOURCE_DIR / f"{name}.cu").read_text()
+            kernels[name] = _load(
+                compile_source(source, name, arch),
+                fact["symbol"],
+                fact["block"],
+                int(fact["shared_memory_bytes"]),
+            )
+        return kernels
+
+
+def register_pool(source: str, registers: int) -> str:
+    """``source`` with its kernel capped at ``registers`` per thread (PTX .maxnreg)
+    instead of __launch_bounds__(512, 1)'s 128; the two qualifiers exclude each other."""
+    bound = "__global__ __launch_bounds__(512, 1) void"
+    if source.count(bound) != 1:
+        raise ValueError("expected one __launch_bounds__(512, 1) kernel")
+    return source.replace(bound, f"__global__ __maxnreg__({registers}) void")
+
+
+@cache
+def load_gemm2_pipe(device_index: int, registers: int = 0) -> _Kernel:
+    """The reference-pipeline + prelude GEMM2 (slot gemm2_pipe) under cluster launch
+    control; ``registers`` > 0 caps it there (the register pool)."""
+    device = torch.device("cuda", device_index)
+    with torch.cuda.device(device):
+        torch.zeros(1, device=device)
+        major, minor = torch.cuda.get_device_capability(device)
+        fact = json.loads((SOURCE_DIR / "launch.json").read_text())["gemm2_pipe"]
+        if tuple(fact["parameters"]) != PARAMETERS["gemm2_pipe"]:
+            raise RuntimeError(
+                f"gemm2_pipe: unexpected launch.json parameters {fact['parameters']}"
+            )
+        source = (SOURCE_DIR / "gemm2_pipe.cu").read_text()
+        name = "gemm2_pipe"
+        if registers:
+            source = register_pool(source, registers)
+            name += f"_r{registers}"
+        return _load(
+            compile_source(source, name, f"sm_{major}{minor}a"),
+            fact["symbol"],
+            fact["block"],
+            int(fact["shared_memory_bytes"]),
+        )
+
+
+@cache
+def load_route_wide(device_index: int) -> _Kernel:
+    device = torch.device("cuda", device_index)
+    with torch.cuda.device(device):
+        torch.zeros(1, device=device)
+        major, minor = torch.cuda.get_device_capability(device)
+        source = (SOURCE_DIR / "route_wide.cu").read_text()
+        cubin = compile_source(source, "route_wide", f"sm_{major}{minor}a")
+        return _load(
+            cubin, "dsv41_routed_expert_route_wide", (ROUTE_WIDE_THREADS, 1, 1), 0
+        )
+
+
+# Triton's libdevice reflection (flush to zero, approximate sqrt and division), so the router
+# math is bit for bit moe_fused_gate's.
+GATE_TOPK_NVRTC_OPTIONS = (
+    "-std=c++17",
+    "-default-device",
+    "--ftz=true",
+    "--prec-sqrt=false",
+    "--prec-div=false",
+)
+# The warp router's build (nvcc -O3, no fast math): no flush to zero. gate_topk.cuh writes
+# its float operations as PTX, so these only set the compares and selects around them.
+GATE_TOPK_WARP_NVRTC_OPTIONS = ("-std=c++17", "-default-device")
+GATE_TOPK_HEADERS = ("gate_topk.cuh",)
+# slot gate_route: the router's top-k and the route record in one cluster launch of one CTA
+# per row (gate_route.cuh), at 1-MAX_ROWS rows; per router (experts, top_k) as gate_topk
+GATE_ROUTE_VARIANTS = {
+    (GATE_TOPK_EXPERTS, GATE_TOPK_TOP_K): ("gate_route", "dsv41_gate_route"),
+    (DRAFT_GATE_TOPK_EXPERTS, DRAFT_GATE_TOPK_TOP_K): (
+        "gate_route_draft",
+        "dsv41_gate_route_e128_k3",
+    ),
+}
+GATE_ROUTE_HEADERS = ("gate_topk.cuh", "route.cuh", "route_quant.cuh", "gate_route.cuh")
+# slot gate_route_quant: gate_route that also writes the routed input's MXFP8 quant (FlashInfer's
+# linear-layout mxfp8_quantize bit for bit, route_quant.cuh), so no routed-quant stream joins
+# the chain before the top-k
+GATE_ROUTE_QUANT_VARIANTS = {
+    (GATE_TOPK_EXPERTS, GATE_TOPK_TOP_K): (
+        "gate_route_quant",
+        "dsv41_gate_route_quant",
+    ),
+    (DRAFT_GATE_TOPK_EXPERTS, DRAFT_GATE_TOPK_TOP_K): (
+        "gate_route_quant_draft",
+        "dsv41_gate_route_quant_e128_k3",
+    ),
+}
+
+# Which kernel serves moe_fused_gate for the DSV4.1 routers in the installed SGLang, as
+# gate_topk.cuh's DSV41_GATE_REFERENCE: the Triton router, or the CUDA warp router
+# (route_warp.cuh, sgl-project/sglang#47641) with its renormalize sum before or after
+# sgl-project/sglang#49017.
+GATE_REFERENCE_TRITON = 0
+GATE_REFERENCE_WARP = 1
+GATE_REFERENCE_WARP_SUM = 2
+
+# What the probe below reads (test/unit/test_contract.py pins them where installed)
+SGLANG_OPTIONAL_READS = {
+    "kernels/ops/moe/moe_route_warp.py": (
+        "moe_route_warp",
+        "covered",
+        "bias_layout_ok",
+    ),
+}
+
+# route_warp.cuh's renormalize reduction, by reference
+_WARP_SUM_LINES = {
+    "warp::reduce_sum<std::bit_ceil(K)>(w)": GATE_REFERENCE_WARP,
+    "warp::reduce_sum<1,std::bit_ceil(K)>(w)": GATE_REFERENCE_WARP_SUM,
+}
+# sha256 of the warp router's fast-math sqrt_softplus (route_warp.cuh's sqrtsoftplus, later
+# sgl_kernel/activation.cuh's sqrt_softplus<true>) from its kHalfL2e constant to its return,
+# comments and whitespace removed and the math:: constants spelled as the first version's.
+_WARP_SQRT_SOFTPLUS_SHA256 = (
+    "0a5fb696fd4e767294917d481260e498f640430dcb7243589e5e6657b9f53dd0"
+)
+
+
+def _warp_sqrt_softplus_digest(text: str) -> Optional[str]:
+    import hashlib
+    import re
+
+    flat = re.sub(r"\s+", "", re.sub(r"//[^\n]*", "", text))
+    begin = flat.find("constexprfloatkHalfL2e=")
+    end = flat.find("*(pos?1.0f:w);", begin)
+    if begin < 0 or end < 0:
+        return None
+    body = flat[begin : end + len("*(pos?1.0f:w);")]
+    body = body.replace("math::log2e", "kLog2e").replace("math::loge2", "kLn2")
+    return hashlib.sha256(body.encode()).hexdigest()
+
+
+def _warp_reference(jit_dir: Path) -> Optional[int]:
+    """The warp router variant whose source is under ``jit_dir`` (SGLang's
+    ``kernels/jit``), or None when its sqrt_softplus or renormalize sum is not one
+    gate_topk.cuh reproduces."""
+    import re
+
+    route = (jit_dir / "csrc" / "moe" / "route_warp.cuh").read_text()
+    activation = jit_dir / "include" / "sgl_kernel" / "activation.cuh"
+    sources = [route] + ([activation.read_text()] if activation.is_file() else [])
+    if not any(
+        _warp_sqrt_softplus_digest(t) == _WARP_SQRT_SOFTPLUS_SHA256 for t in sources
+    ):
+        return None
+    flat = re.sub(r"\s+", "", re.sub(r"//[^\n]*", "", route))
+    if not ("sqrt_softplus(x)" in flat or "sqrtsoftplus(x)" in flat):
+        return None  # the router scores with another sqrt_softplus (e.g. <false>)
+    found = {ref for line, ref in _WARP_SUM_LINES.items() if f"sum={line};" in flat}
+    return found.pop() if len(found) == 1 else None
+
+
+@cache
+def gate_reference(experts: int, top_k: int) -> Optional[int]:
+    """The kernel moe_fused_gate runs for this DSV4.1 router (sqrtsoftplus, fp32 logits,
+    ungrouped, no fused shared expert) in the installed SGLang, or None when it is one
+    gate_topk.cuh does not reproduce. Probed from SGLang's kernels, not its version."""
+    try:
+        from sglang.kernels.ops.moe import moe_route_warp
+    except ImportError:  # SGLang before sgl-project/sglang#47641
+        return GATE_REFERENCE_TRITON
+    if not moe_route_warp.covered(torch.float32, experts, top_k, "sqrtsoftplus"):
+        return GATE_REFERENCE_TRITON
+    jit_dir = Path(moe_route_warp.__file__).resolve().parents[2] / "jit"
+    try:
+        return _warp_reference(jit_dir)
+    except OSError:
+        return None
+
+
+def warp_bias_layout_ok(*biases) -> bool:
+    """Whether SGLang's warp router takes these router biases (else it runs the Triton
+    router, which a warp-reference gate_topk.cuh does not reproduce)."""
+    try:
+        from sglang.kernels.ops.moe import moe_route_warp
+    except ImportError:
+        return True
+    return moe_route_warp.bias_layout_ok(*biases)
+
+
+def gate_topk_nvrtc_options(experts: int, top_k: int) -> tuple[str, ...]:
+    """The NVRTC options of every program that includes gate_topk.cuh for this router:
+    the build of the reference ``gate_reference`` found, and DSV41_GATE_REFERENCE (which
+    gate_topk.cuh requires)."""
+    reference = gate_reference(experts, top_k)
+    if reference is None:
+        raise RuntimeError(
+            f"the installed SGLang routes ({experts} experts, top-{top_k}) with a kernel "
+            "gate_topk.cuh does not reproduce"
+        )
+    options = (
+        GATE_TOPK_NVRTC_OPTIONS
+        if reference == GATE_REFERENCE_TRITON
+        else GATE_TOPK_WARP_NVRTC_OPTIONS
+    )
+    return options + (f"-DDSV41_GATE_REFERENCE={reference}",)
+
+
+@cache
+def load_gate_topk(
+    device_index: int, experts: int = GATE_TOPK_EXPERTS, top_k: int = GATE_TOPK_TOP_K
+) -> _Kernel:
+    """The gate top-k kernel of the (experts, top_k) router, one thread per expert, built
+    for the installed SGLang's router (``gate_reference``)."""
+    name, symbol = GATE_TOPK_VARIANTS[(experts, top_k)]
+    options = gate_topk_nvrtc_options(experts, top_k)
+    device = torch.device("cuda", device_index)
+    with torch.cuda.device(device):
+        torch.zeros(1, device=device)
+        major, minor = torch.cuda.get_device_capability(device)
+        source = (SOURCE_DIR / f"{name}.cu").read_text()
+        headers = {h: (SOURCE_DIR / h).read_text() for h in GATE_TOPK_HEADERS}
+        cubin = compile_source(
+            source,
+            name,
+            f"sm_{major}{minor}a",
+            options,
+            headers=headers,
+        )
+        return _load(cubin, symbol, (experts, 1, 1), 0)
+
+
+@cache
+def load_gate_route(
+    device_index: int,
+    experts: int = GATE_TOPK_EXPERTS,
+    top_k: int = GATE_TOPK_TOP_K,
+    quant: bool = False,
+    release: int = 0,
+) -> _Kernel:
+    """The fused top-k + route kernel of the (experts, top_k) router (slot gate_route);
+    with ``quant``, the build that also quantizes the routed input (slot gate_route_quant).
+    ``release`` (gate_route.cuh GATE_ROUTE_RELEASE): where it releases GEMM1, 0 at entry,
+    1 after its grid-dependency wait, 3 after the row's top-k, 2 at its completion (behind
+    slot gate_route_early's router). Built for the installed SGLang's router
+    (``gate_reference``)."""
+    variants = GATE_ROUTE_QUANT_VARIANTS if quant else GATE_ROUTE_VARIANTS
+    name, symbol = variants[(experts, top_k)]
+    options = gate_topk_nvrtc_options(experts, top_k)
+    if release:
+        options += (f"-DGATE_ROUTE_RELEASE={release}",)
+    device = torch.device("cuda", device_index)
+    with torch.cuda.device(device):
+        torch.zeros(1, device=device)
+        major, minor = torch.cuda.get_device_capability(device)
+        source = (SOURCE_DIR / f"{name}.cu").read_text()
+        headers = {h: (SOURCE_DIR / h).read_text() for h in GATE_ROUTE_HEADERS}
+        cubin = compile_source(
+            source,
+            name + (f"_r{release}" if release else ""),
+            f"sm_{major}{minor}a",
+            options,
+            headers=headers,
+        )
+        return _load(cubin, symbol, (experts, 1, 1), 0)
+
+
+def _weight_map(weights: torch.Tensor, m: int, k: int, chunks: int):
+    """TMA map of MXFP4 weights ``[E, m, k / 2]`` (16U4, 128B swizzle)."""
+    cu = _driver()
+    if weights.data_ptr() % 32:
+        raise ValueError("packed expert weights must be 32-byte aligned")
+    u64, u32 = cu.cuuint64_t, cu.cuuint32_t
+    (tensor_map,) = _check(
+        cu.cuTensorMapEncodeTiled(
+            cu.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B,
+            4,
+            weights.data_ptr(),
+            [u64(128), u64(m), u64(k // 128), u64(weights.size(0))],
+            [u64(k // 2), u64(64), u64(m * k // 2)],
+            [u32(128), u32(128), u32(chunks), u32(1)],
+            [u32(1)] * 4,
+            cu.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+            cu.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B,
+            cu.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            cu.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        ),
+        "cuTensorMapEncodeTiled(weights)",
+    )
+    return tensor_map
+
+
+def _scale_map(scales: torch.Tensor, groups: int):
+    """TMA map of 128x4-layout scale bytes viewed as ``[bytes/256, 256]``."""
+    cu = _driver()
+    total = scales.numel() * scales.element_size()
+    if total % 256 or scales.data_ptr() % 16:
+        raise ValueError("weight scales must be whole 256-byte rows, 16-byte aligned")
+    u64, u32 = cu.cuuint64_t, cu.cuuint32_t
+    (tensor_map,) = _check(
+        cu.cuTensorMapEncodeTiled(
+            cu.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            2,
+            scales.data_ptr(),
+            [u64(256), u64(total // 256)],
+            [u64(256)],
+            [u32(256), u32(2 * groups)],
+            [u32(1)] * 2,
+            cu.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+            cu.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE,
+            cu.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            cu.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        ),
+        "cuTensorMapEncodeTiled(scales)",
+    )
+    return tensor_map
+
+
+def _activation_map(values: torch.Tensor):
+    """TMA map of the MXFP8 intermediate ``[rows, 640]`` (u8) as {640, rows}, box
+    {128, 8}, 128-byte swizzle: one load lands one 128-K chunk of one 8-row tile as the
+    K-major atom gemm2.cu's cp.async path writes (muLLM's activation map)."""
+    cu = _driver()
+    if values.data_ptr() % 16:
+        raise ValueError("the intermediate must be 16-byte aligned")
+    u64, u32 = cu.cuuint64_t, cu.cuuint32_t
+    (tensor_map,) = _check(
+        cu.cuTensorMapEncodeTiled(
+            cu.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            2,
+            values.data_ptr(),
+            [u64(PADDED), u64(values.size(0))],
+            [u64(PADDED)],
+            [u32(128), u32(TILE)],
+            [u32(1)] * 2,
+            cu.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+            cu.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B,
+            cu.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            cu.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+        ),
+        "cuTensorMapEncodeTiled(intermediate)",
+    )
+    return tensor_map
+
+
+def check_weights(w13, w13_scale, w2, w2_scale, clamp, top_k: int) -> None:
+    """Raise ValueError unless the weights have the layout the kernels read."""
+    experts = w13.size(0)
+    expected = (
+        (w13, (experts, 2 * PADDED, HIDDEN // 2)),
+        (w13_scale, (experts, 2 * PADDED, HIDDEN // 32)),
+        (w2, (experts, HIDDEN, PADDED // 2)),
+        (w2_scale, (experts, HIDDEN, PADDED // 32)),
+    )
+    for tensor, shape in expected:
+        if (
+            tuple(tensor.shape) != shape
+            or tensor.element_size() != 1
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                f"expected a contiguous {shape} 1-byte tensor, got {tuple(tensor.shape)} {tensor.dtype}"
+            )
+    if experts % 32 or not 0 < experts <= MAX_EXPERTS:
+        raise ValueError(
+            f"expected a multiple of 32 local experts <= {MAX_EXPERTS}, got {experts}"
+        )
+    if not 1 <= top_k <= MAX_TOP_K:
+        raise ValueError(f"expected a top-k of 1-{MAX_TOP_K}, got {top_k}")
+    if (
+        clamp is None
+        or clamp.dtype != torch.float32
+        or tuple(clamp.shape) != (experts,)
+    ):
+        raise ValueError("expected an FP32 [E] SwiGLU clamp limit")
+    # GEMM1 never reads w13's padding tile, so the padding must be zero, as must the
+    # matching K columns of w2.
+    if (
+        torch.count_nonzero(w13.view(torch.uint8)[:, 2 * SLICE :]).item()
+        or torch.count_nonzero(w2.view(torch.uint8)[:, :, SLICE // 2 :]).item()
+    ):
+        raise ValueError("the intermediate padding of w13/w2 is not zero")
+
+
+class RoutedExpertGemm:
+    """The route kernel and GEMM pair bound to one MoE layer's weights."""
+
+    def __init__(
+        self,
+        w13,
+        w13_scale,
+        w2,
+        w2_scale,
+        clamp,
+        top_k: int,
+        max_rows: int,
+        gate_topk: bool = False,
+        router_experts: Optional[int] = None,
+        expert_offset: int = 0,
+        gemm2_pipe: bool = False,
+        gemm2_registers: int = 0,
+        gate_route: bool = False,
+        gate_route_quant: bool = False,
+        deal_group: int = -1,
+    ):
+        """``router_experts``: the router's expert count (default: the local ones);
+        ``expert_offset``: the router id of local expert 0 (expert parallelism);
+        ``deal_group`` (0 or 1, slot moe_balanced; -1 off): the rank holds all the
+        router's experts and serves the step's distinct experts dealt to its group of
+        two expert-parallel groups (route.cuh, "Balanced dealing");
+        ``gate_route`` (with ``gate_topk``): at 1-8 rows the top-k and the route record
+        in one launch (gate_route.cuh); ``gate_route_quant`` (with ``gate_route``): that
+        launch also quantizes the routed input (``gate_topk_and_gemms(x=...)``);
+        ``gemm2_pipe``: GEMM2 on its reference-pipeline + prelude build (slot
+        gemm2_pipe), at ``gemm2_registers`` per thread when > 0 (the register pool)."""
+        w13, w13_scale = w13.view(torch.uint8), w13_scale.view(torch.uint8)
+        w2, w2_scale = w2.view(torch.uint8), w2_scale.view(torch.uint8)
+        check_weights(w13, w13_scale, w2, w2_scale, clamp, top_k)
+        if not MAX_ROWS <= max_rows <= WIDE_MAX_ROWS:
+            raise ValueError(
+                f"max_rows {max_rows} is outside {MAX_ROWS}-{WIDE_MAX_ROWS}"
+            )
+        self.experts = int(w13.size(0))
+        self.router_experts = (
+            self.experts if router_experts is None else int(router_experts)
+        )
+        self.expert_offset = int(expert_offset)
+        if not (
+            0 <= self.expert_offset
+            and self.expert_offset + self.experts <= self.router_experts
+        ):
+            raise ValueError(
+                f"local experts [{self.expert_offset}, "
+                f"{self.expert_offset + self.experts}) are outside the router's "
+                f"{self.router_experts}"
+            )
+        self.deal_group = int(deal_group)
+        if self.deal_group >= 0 and (
+            self.deal_group >= DEAL_GROUPS
+            or self.expert_offset != 0
+            or self.experts != self.router_experts
+        ):
+            raise ValueError(
+                f"balanced dealing needs all {self.router_experts} experts and a group "
+                f"below {DEAL_GROUPS}, got {self.experts} experts from "
+                f"{self.expert_offset}, group {self.deal_group}"
+            )
+        # the route kernels' expert_offset argument: negative selects the dealing
+        self.route_offset = (
+            -1 - self.deal_group if self.deal_group >= 0 else self.expert_offset
+        )
+        self.top_k = top_k
+        self.max_rows = max_rows
+        self.kernels = load_kernels(w13.device.index)
+        self.route_wide = (
+            load_route_wide(w13.device.index) if max_rows > MAX_ROWS else None
+        )
+        # the router's (experts, top_k) picks the variant: target or DSpark draft
+        # and the installed SGLang's router must be one gate_topk.cuh reproduces
+        fits_gate_topk = (self.router_experts, top_k) in GATE_TOPK_VARIANTS and (
+            gate_reference(self.router_experts, top_k) is not None
+        )
+        self.gate_topk_kernel = (
+            load_gate_topk(w13.device.index, self.router_experts, top_k)
+            if gate_topk and fits_gate_topk
+            else None
+        )
+        self.gate_route_kernel = (
+            load_gate_route(w13.device.index, self.router_experts, top_k)
+            if self.gate_topk_kernel is not None
+            and gate_route
+            and (self.router_experts, top_k) in GATE_ROUTE_VARIANTS
+            else None
+        )
+        self.gate_route_quant_kernel = (
+            load_gate_route(w13.device.index, self.router_experts, top_k, quant=True)
+            if self.gate_route_kernel is not None
+            and gate_route_quant
+            and (self.router_experts, top_k) in GATE_ROUTE_QUANT_VARIANTS
+            else None
+        )
+        # slot gate_route_early: the builds above with GEMM1's release moved
+        # (bind_early_release), keyed by quant; empty without the slot
+        self.gate_route_early_kernels: dict = {}
+        # route.cu flips bit 31 of this word on every launch.
+        self.barrier = torch.zeros(1, dtype=torch.int32, device=w13.device)
+        self._tensors = (
+            w13,
+            w13_scale,
+            w2,
+            w2_scale,
+            clamp,
+        )  # the maps hold their addresses
+        self.clamp = clamp
+        self.gemm1_maps = (
+            _weight_map(w13, 2 * PADDED, HIDDEN, 2),
+            _scale_map(w13_scale, 4),
+        )
+        self.gemm2_maps = (_weight_map(w2, HIDDEN, PADDED, 2), _scale_map(w2_scale, 1))
+        if gemm2_registers and not gemm2_pipe:
+            raise ValueError("the GEMM2 register pool is a build of the pipeline GEMM2")
+        # slot gemm2_reg_pool: the cap this layer's GEMM2 was built at (0: none)
+        self.gemm2_registers = int(gemm2_registers) if gemm2_pipe else 0
+        self.gemm2_pipe = (
+            load_gemm2_pipe(w13.device.index, int(gemm2_registers))
+            if gemm2_pipe
+            else None
+        )
+
+    def _gemm_launches(self, ctas: int):
+        """(GEMM1 kernel, grid), (GEMM2 kernel, grid) for ``ctas`` token tiles; fixed
+        by the call's shape, never by its routes, so one graph keeps one kernel."""
+        return (
+            (self.kernels["gemm1"], (GEMM1_UNITS, ctas, 1)),
+            (self.gemm2_pipe or self.kernels["gemm2"], (GEMM2_UNITS, ctas, 1)),
+        )
+
+    def _launch_gemm2(
+        self, gemm2, grid2, h_values, h_scales, record, gemm2_rows, words, stream
+    ):
+        """GEMM2; the pipeline build reads the intermediate through a tensor map, encoded
+        here (under capture: once, on the graph pool's fixed address)."""
+        h = _activation_map(h_values) if self.gemm2_pipe else _pointer(h_values)
+        _launch(
+            gemm2,
+            grid2,
+            [
+                *self.gemm2_maps,
+                h,
+                _pointer(h_scales),
+                _pointer(record),
+                _pointer(gemm2_rows),
+                words,
+            ],
+            stream,
+        )
+
+    def supports(self, x_quant, x_scale, topk_ids, topk_weights) -> bool:
+        rows = x_quant.size(0)
+        return (
+            1 <= rows <= self.max_rows
+            and topk_ids.dim() == 2
+            and topk_ids.size(1) == self.top_k
+            and tuple(x_quant.shape) == (rows, HIDDEN)
+            and x_quant.element_size() == 1
+            and x_quant.is_contiguous()
+            and x_scale is not None
+            and x_scale.element_size() == 1
+            and x_scale.is_contiguous()
+            and x_scale.numel() >= rows * HIDDEN // 32
+            and topk_weights.dtype == torch.float32
+        )
+
+    def __call__(self, x_quant, x_scale, topk_ids, topk_weights):
+        """Route + GEMM1 + GEMM2 on the current stream; returns FlashInfer's
+        deferred-finalize triple (gemm2 rows, weights, slot -> permuted row)."""
+        rows, top_k = topk_ids.shape
+        device = x_quant.device
+        stream = torch.cuda.current_stream(device).cuda_stream
+        ids = topk_ids.to(torch.int32).contiguous()
+        ctas = max_ctas(rows, top_k, self.experts)
+        permuted = torch.empty((rows, top_k), dtype=torch.int32, device=device)
+        record = torch.empty(route_words(ctas), dtype=torch.int32, device=device)
+        if rows > MAX_ROWS:
+            _launch(
+                self.route_wide,
+                (1, 1, 1),
+                [
+                    _pointer(ids),
+                    _pointer(permuted),
+                    _pointer(record),
+                    ctypes.c_int32(rows),
+                    ctypes.c_int32(top_k),
+                    ctypes.c_int32(self.experts),
+                    ctypes.c_int32(self.route_offset),
+                ],
+                stream,
+            )
+        else:
+            _launch(
+                self.kernels["route"],
+                (1, 1, 1),
+                [
+                    _pointer(ids),
+                    _pointer(permuted),
+                    _pointer(record),
+                    _pointer(self.barrier),
+                    ctypes.c_int32(rows),
+                    ctypes.c_int32(top_k),
+                    ctypes.c_int32(self.experts),
+                    ctypes.c_int32(self.route_offset),
+                ],
+                stream,
+            )
+        padded_rows = TILE * ctas
+        h_values = torch.empty((padded_rows, PADDED), dtype=torch.uint8, device=device)
+        h_scales = torch.empty(
+            (padded_rows + 127) // 128 * 128 * PADDED // 32,
+            dtype=torch.uint8,
+            device=device,
+        )
+        gemm2_rows = torch.empty(
+            (rows * top_k * TILE, HIDDEN), dtype=torch.bfloat16, device=device
+        )
+        words = ctypes.c_int32(cta_words(ctas))
+        (gemm1, grid1), (gemm2, grid2) = self._gemm_launches(ctas)
+        _launch(
+            gemm1,
+            grid1,
+            [
+                *self.gemm1_maps,
+                _pointer(x_quant),
+                _pointer(x_scale),
+                _pointer(record),
+                _pointer(self.clamp),
+                _pointer(h_values),
+                _pointer(h_scales),
+                words,
+            ],
+            stream,
+        )
+        self._launch_gemm2(
+            gemm2, grid2, h_values, h_scales, record, gemm2_rows, words, stream
+        )
+        return gemm2_rows, topk_weights.contiguous().view(rows, top_k), permuted
+
+    def gate_topk_and_gemms(
+        self,
+        x_quant: torch.Tensor,
+        x_scale: torch.Tensor,
+        logits: torch.Tensor,
+        bias: torch.Tensor,
+        routed_scaling_factor: float,
+        num_valid: Optional[torch.Tensor],
+        alt: Optional[tuple[torch.Tensor, torch.Tensor, int]] = None,
+        renormalize_epsilon: float = 0.0,
+        ids_out: Optional[torch.Tensor] = None,
+        x: Optional[torch.Tensor] = None,
+        early: bool = False,
+    ):
+        """``__call__`` from the router's fp32 logits: the router's gate_topk.cuh variant
+        does moe_fused_gate's top-k (sqrtsoftplus via log1p, renormalized, scaled), then
+        the route kernel. ``alt`` = (bias_alt, input_ids, token id): rows whose token is
+        that id rank with bias_alt (DSV4.1 VL routing). ``num_valid`` None means every row is valid. The
+        caller joins the quantized input before this call: a stream join between the route
+        kernel and GEMM1 would cost GEMM1 its PDL early launch.
+        The ids are the router's; a slot whose expert another rank holds maps to row -1.
+        ``ids_out``: an int32 [>= rows, top_k] buffer the top-k ids go to (a persistent
+        one for runtime/bench.py's step stamps), else a new tensor.
+        ``x``: the BF16 routed input [rows, HIDDEN] in place of ``x_quant`` / ``x_scale``
+        (None): slot gate_route_quant's launch quantizes it (``serves_gate_route_quant``).
+        ``early``: slot gate_route_early's router launched the logits (it releases this
+        launch early), so the one-launch top-k runs its ``bind_early_release`` build.
+        Returns (gemm2 rows, top-k weights, slot -> row, top-k ids)."""
+        rows = logits.size(0)
+        device = logits.device
+        stream = torch.cuda.current_stream(device).cuda_stream
+        weights = torch.empty((rows, self.top_k), dtype=torch.float32, device=device)
+        if ids_out is not None:
+            ids = ids_out[:rows]
+        else:
+            ids = torch.empty((rows, self.top_k), dtype=torch.int32, device=device)
+        bias_alt, input_ids, alt_token_id = alt if alt is not None else (None, None, -1)
+        gate_args = [
+            _pointer(logits),
+            _pointer(bias),
+            _null_or_pointer(bias_alt),
+            _null_or_pointer(input_ids),
+            ctypes.c_int32(input_ids is not None and input_ids.dtype == torch.int64),
+            ctypes.c_int64(alt_token_id),
+            _null_or_pointer(num_valid),
+            _pointer(weights),
+            _pointer(ids),
+            ctypes.c_float(routed_scaling_factor),
+            ctypes.c_float(renormalize_epsilon),
+        ]
+        ctas = max_ctas(rows, self.top_k, self.experts)
+        if x is not None:
+            if not self.serves_gate_route_quant(rows, input_ids, x):
+                raise ValueError(
+                    "slot gate_route_quant does not take this call: "
+                    f"{rows} rows, x {x.dtype} {tuple(x.shape)}"
+                )
+            x_quant = torch.empty((rows, HIDDEN), dtype=torch.uint8, device=device)
+            x_scale = torch.empty(
+                (rows, HIDDEN // 32), dtype=torch.uint8, device=device
+            )
+        if self.serves_gate_route(rows, input_ids):
+            # one cluster of one CTA per row: the top-k, then CTA 0 builds the record
+            permuted = torch.empty((rows, self.top_k), dtype=torch.int32, device=device)
+            record = torch.empty(route_words(ctas), dtype=torch.int32, device=device)
+            extra = (
+                [_pointer(x), _pointer(x_quant), _pointer(x_scale)]
+                if x is not None
+                else []
+            )
+            kernel = (
+                self.gate_route_quant_kernel
+                if x is not None
+                else self.gate_route_kernel
+            )
+            if early and self.gate_route_early_kernels:
+                kernel = self.gate_route_early_kernels[x is not None]
+            _launch(
+                kernel,
+                (rows, 1, 1),
+                gate_args
+                + [
+                    _pointer(permuted),
+                    _pointer(record),
+                    ctypes.c_int32(self.experts),
+                    ctypes.c_int32(self.route_offset),
+                ]
+                + extra,
+                stream,
+                cluster=(rows, 1, 1),
+            )
+        else:
+            _launch(self.gate_topk_kernel, (rows, 1, 1), gate_args, stream)
+            permuted, record = self._route(ids, rows, ctas)
+        return self._gemms(x_quant, x_scale, record, ctas), weights, permuted, ids
+
+    def bind_early_release(self, release: int) -> None:
+        """Slot gate_route_early: the one-launch top-k builds (with and without the
+        routed-input quant, where built) that release GEMM1 at ``release``
+        (``load_gate_route``), taken by ``gate_topk_and_gemms(early=True)``."""
+        if self.gate_route_kernel is None:
+            raise ValueError("slot gate_route_early needs the gate_route build")
+        device = self.clamp.device.index
+        kernels = {
+            False: load_gate_route(
+                device, self.router_experts, self.top_k, release=release
+            )
+        }
+        if self.gate_route_quant_kernel is not None:
+            kernels[True] = load_gate_route(
+                device, self.router_experts, self.top_k, quant=True, release=release
+            )
+        self.gate_route_early_kernels = kernels
+
+    def serves_gate_route(self, rows: int, input_ids=None) -> bool:
+        """Slot gate_route takes this call: 1-8 rows, and every launched row has a token
+        id when the router reads them (the fused kernel loads them unconditionally)."""
+        return (
+            self.gate_route_kernel is not None
+            and 1 <= rows <= MAX_ROWS
+            and (input_ids is None or input_ids.numel() >= rows)
+        )
+
+    def serves_gate_route_quant(self, rows: int, input_ids=None, x=None) -> bool:
+        """Slot gate_route_quant takes this call: gate_route does, and ``x`` (when given)
+        is the contiguous BF16 [rows, HIDDEN] input the fused quant reads."""
+        return (
+            self.gate_route_quant_kernel is not None
+            and self.serves_gate_route(rows, input_ids)
+            and (
+                x is None
+                or (
+                    x.dtype == torch.bfloat16
+                    and tuple(x.shape) == (rows, HIDDEN)
+                    and x.is_contiguous()
+                    and x.data_ptr() % 16 == 0
+                )
+            )
+        )
+
+    def _route(self, ids: torch.Tensor, rows: int, ctas: int):
+        """The route kernel __call__ launches (route_wide.cu above 8 rows)."""
+        stream = torch.cuda.current_stream(ids.device).cuda_stream
+        permuted = torch.empty((rows, self.top_k), dtype=torch.int32, device=ids.device)
+        record = torch.empty(route_words(ctas), dtype=torch.int32, device=ids.device)
+        common = [_pointer(ids), _pointer(permuted), _pointer(record)]
+        sizes = [
+            ctypes.c_int32(rows),
+            ctypes.c_int32(self.top_k),
+            ctypes.c_int32(self.experts),
+            ctypes.c_int32(self.route_offset),
+        ]
+        if rows > MAX_ROWS:
+            _launch(self.route_wide, (1, 1, 1), common + sizes, stream)
+        else:
+            _launch(
+                self.kernels["route"],
+                (1, 1, 1),
+                common + [_pointer(self.barrier)] + sizes,
+                stream,
+            )
+        return permuted, record
+
+    def supports_inputs(self, x_quant, x_scale) -> bool:
+        rows = x_quant.size(0)
+        return (
+            1 <= rows <= self.max_rows
+            and tuple(x_quant.shape) == (rows, HIDDEN)
+            and x_quant.element_size() == 1
+            and x_quant.is_contiguous()
+            and x_scale is not None
+            and x_scale.element_size() == 1
+            and x_scale.is_contiguous()
+            and x_scale.numel() >= rows * HIDDEN // 32
+        )
+
+    def supports_gate_topk(self, logits: torch.Tensor, bias: torch.Tensor) -> bool:
+        return (
+            self.gate_topk_kernel is not None
+            and logits.dtype == torch.float32
+            and logits.dim() == 2
+            and logits.is_contiguous()
+            and tuple(logits.shape[1:]) == (self.router_experts,)
+            and 1 <= logits.size(0) <= self.max_rows
+            and bias.dtype == torch.float32
+            and bias.is_contiguous()
+        )
+
+    def _gemms(self, x_quant, x_scale, record, ctas, gemm2_rows=None):
+        """GEMM1 + GEMM2 over a built route record (into ``gemm2_rows`` when given)."""
+        device = x_quant.device
+        stream = torch.cuda.current_stream(device).cuda_stream
+        rows = x_quant.size(0)
+        padded_rows = TILE * ctas
+        h_values = torch.empty((padded_rows, PADDED), dtype=torch.uint8, device=device)
+        h_scales = torch.empty(
+            (padded_rows + 127) // 128 * 128 * PADDED // 32,
+            dtype=torch.uint8,
+            device=device,
+        )
+        if gemm2_rows is None:
+            gemm2_rows = torch.empty(
+                (rows * self.top_k * TILE, HIDDEN), dtype=torch.bfloat16, device=device
+            )
+        words = ctypes.c_int32(cta_words(ctas))
+        (gemm1, grid1), (gemm2, grid2) = self._gemm_launches(ctas)
+        _launch(
+            gemm1,
+            grid1,
+            [
+                *self.gemm1_maps,
+                _pointer(x_quant),
+                _pointer(x_scale),
+                _pointer(record),
+                _pointer(self.clamp),
+                _pointer(h_values),
+                _pointer(h_scales),
+                words,
+            ],
+            stream,
+        )
+        self._launch_gemm2(
+            gemm2, grid2, h_values, h_scales, record, gemm2_rows, words, stream
+        )
+        return gemm2_rows

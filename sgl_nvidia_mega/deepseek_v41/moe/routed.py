@@ -13,6 +13,7 @@ import logging
 import msgspec
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import arch
 from sgl_nvidia_mega.deepseek_v41.runtime import bench
 
 logger = logging.getLogger(__name__)
@@ -260,9 +261,9 @@ def shared_topk_slots(config) -> int:
 
 def gate_applies(mlp: torch.nn.Module) -> bool:
     """The DSV4.1 router gate_topk.cu reproduces bit for bit."""
-    from sgl_nvidia_mega.deepseek_v41.sm103.moe.routed_expert_gemm import (
-        warp_bias_layout_ok,
-    )
+    warp_bias_layout_ok = arch.kernel_module(
+        "moe.routed_expert_gemm"
+    ).warp_bias_layout_ok
 
     config = mlp.topk.topk_config
     bias_vl = getattr(mlp.gate, "e_score_correction_bias_vl", None)
@@ -371,10 +372,8 @@ def build_layers(
         Mxfp4FlashinferTrtllmMoEMethod,
     )
 
-    from sgl_nvidia_mega.deepseek_v41.sm103.moe.routed_expert_gemm import (
-        SERVED_MAX_ROWS,
-        RoutedExpertGemm,
-    )
+    SERVED_MAX_ROWS = arch.kernel_module("moe.routed_expert_gemm").SERVED_MAX_ROWS
+    RoutedExpertGemm = arch.kernel_module("moe.routed_expert_gemm").RoutedExpertGemm
 
     reason, slots = "", {}
     try:
@@ -437,10 +436,8 @@ def _bind_router(slots: dict) -> str:
     """Slot gate_route_early on each built layer whose router takes it (one early router
     per gate weight); why some did not ("" when all did). Bitwise either way, so the
     ranks need not agree."""
-    from sgl_nvidia_mega.deepseek_v41.sm103.moe.router_mma import (
-        EarlyRouter,
-        gate_route_release,
-    )
+    EarlyRouter = arch.kernel_module("moe.router_mma").EarlyRouter
+    gate_route_release = arch.kernel_module("moe.router_mma").gate_route_release
 
     skipped = {}
     for i, slot in slots.items():

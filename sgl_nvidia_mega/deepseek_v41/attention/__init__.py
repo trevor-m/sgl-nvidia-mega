@@ -17,6 +17,7 @@ from typing import Any
 
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import arch
 from sgl_nvidia_mega.deepseek_v41.attention import chain, indexer, sched_ahead
 from sgl_nvidia_mega.deepseek_v41.attention.step import AttentionStep, disable_reason
 
@@ -50,7 +51,8 @@ def _q_cluster_default_takes(attn) -> bool:
     """Slot attn_q_cluster on a default start (no slot list) only at attention TP8's
     q_cluster.DEFAULT_MAX_HEADS local heads; listed, at every head count it takes."""
     from sgl_nvidia_mega.deepseek_v41 import runtime
-    from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_cluster
+
+    q_cluster = arch.kernels("attention.q_cluster")
 
     if not runtime.default_start() or attn.n_local_heads <= q_cluster.DEFAULT_MAX_HEADS:
         return True
@@ -142,7 +144,7 @@ def build(model, ctx, group) -> dict[int, AttentionStep]:
                 wo_a_fp8_on=step_.wo_a_fp8_weight is not None,
             )
             if step_.core_lean:
-                from sgl_nvidia_mega.deepseek_v41.sm103.attention import core_lean
+                core_lean = arch.kernels("attention.core_lean")
 
                 core_lean.precompile()
             kinds[_chain_kind(attn, step_)] += 1

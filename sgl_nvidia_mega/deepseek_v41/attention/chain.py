@@ -18,14 +18,17 @@ from typing import NamedTuple
 
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import arch
 from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
 from sgl_nvidia_mega.deepseek_v41.attention import ops
-from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
-from sgl_nvidia_mega.deepseek_v41.sm103.attention import core_lean as core_lean_kernel
-from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_cluster as q_cluster_kernel
-from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_norm_gemm, swapab
-from sgl_nvidia_mega.deepseek_v41.sm103.attention import wo_a as wo_a_kernel
-from sgl_nvidia_mega.deepseek_v41.sm103.attention.q_norm_quant import rmsnorm_mxfp8
+
+mxfp8_ll = arch.kernels("mxfp8_ll")
+core_lean_kernel = arch.kernels("attention.core_lean")
+q_cluster_kernel = arch.kernels("attention.q_cluster")
+q_norm_gemm = arch.kernels("attention.q_norm_gemm")
+swapab = arch.kernels("attention.swapab")
+wo_a_kernel = arch.kernels("attention.wo_a")
+q_norm_quant = arch.kernels("attention.q_norm_quant")
 
 logger = logging.getLogger(__name__)
 
@@ -495,7 +498,7 @@ class ChainOps:
             return None, DeferredNorm(q)
         if not self.wq_b_ll:
             return ops.normalize_q_lora(attn, q)
-        y, quant, scale = rmsnorm_mxfp8(
+        y, quant, scale = q_norm_quant.rmsnorm_mxfp8(
             q,
             attn.q_norm.weight,
             attn.q_norm.variance_epsilon,
@@ -776,7 +779,7 @@ def precompile(
             max(rows), width, dtype=torch.bfloat16, device=attn.q_norm.weight.device
         )
         for r in rows:
-            rmsnorm_mxfp8(
+            q_norm_quant.rmsnorm_mxfp8(
                 x[:r, :k],
                 attn.q_norm.weight,
                 attn.q_norm.variance_epsilon,

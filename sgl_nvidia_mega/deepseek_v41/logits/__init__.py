@@ -21,6 +21,7 @@ import logging
 
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import arch
 from sgl_nvidia_mega.deepseek_v41.sampler import (
     LM_HEAD_BACKEND,
     low_m_lm_head_supported,
@@ -102,7 +103,7 @@ class LowMLmHeadMethod:
             self.captured_rows.add(rows)
             logger.info("NVIDIA megakernel: target_lm_head captured at %d rows", rows)
         if self.mxfp8 is not None:
-            from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+            lm_head_mxfp8 = arch.kernels("lm_head_mxfp8")
 
             return lm_head_mxfp8.matmul(x, self.mxfp8, xload=self.xload)
         if self.pinned:
@@ -117,7 +118,7 @@ class LowMLmHeadMethod:
         """The same calls on every rank, before any graph is captured; the draft's head
         shares the weight, so this and the draft's tuning share FlashInfer's cache."""
         if self.mxfp8 is not None:
-            from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+            lm_head_mxfp8 = arch.kernels("lm_head_mxfp8")
 
             lm_head_mxfp8.precompile(
                 *self.mxfp8.shape, self.weight.device, xload=self.xload
@@ -154,7 +155,7 @@ def _capturing() -> bool:
 
 def mxfp8_copy(weight):
     """The shard's MXFP8 copy, one per weight (the draft's head shares it)."""
-    from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+    lm_head_mxfp8 = arch.kernels("lm_head_mxfp8")
 
     copy = lm_head_mxfp8.shared(weight)
     logger.info(
@@ -183,7 +184,7 @@ def target_lm_head_reason(lm, *, mxfp8: bool = False) -> str:
     if proc.rl_on_policy_target is not None:
         return "SGLang's on-policy target branch"
     if mxfp8:
-        from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+        lm_head_mxfp8 = arch.kernels("lm_head_mxfp8")
 
         return lm_head_mxfp8.unsupported_reason(weight)
     if not low_m_lm_head_supported():
@@ -204,7 +205,7 @@ def build(model, ctx, group):
         return None
     copy = mxfp8_copy(model.lm_head.weight) if mxfp8 else None
     if copy is not None:
-        from sgl_nvidia_mega.deepseek_v41.sm103 import lm_head_mxfp8
+        lm_head_mxfp8 = arch.kernels("lm_head_mxfp8")
 
         reason = lm_head_mxfp8.scale_reason(copy)
         if not _all_ranks_true(group, not reason):

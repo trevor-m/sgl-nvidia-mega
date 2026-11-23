@@ -11,6 +11,7 @@ from typing import Optional
 
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import arch
 from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
 
 logger = logging.getLogger(__name__)
@@ -82,7 +83,8 @@ def build(
     hop_final_collapse, with ``hop_b``) are AllReduceMHC's, on every mailbox;
     ``wo_b_split`` (slot wo_b_publish_split) repacks every target layer's wo_b for muLLM's
     split-K publishing projection at 1-8 rows."""
-    from sgl_nvidia_mega.deepseek_v41.sm103.runner import Runner, SplitPublisher
+    Runner = arch.kernel_module("runner").Runner
+    SplitPublisher = arch.kernel_module("runner").SplitPublisher
 
     m = model.model
     cfg = model.config

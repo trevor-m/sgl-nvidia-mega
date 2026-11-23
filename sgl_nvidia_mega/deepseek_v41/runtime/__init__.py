@@ -11,6 +11,8 @@ from typing import Any
 
 import msgspec
 
+from sgl_nvidia_mega.deepseek_v41 import arch
+
 # Slots described with the opt-in slots below that run by default: each measured faster
 # served at batch 1 (a 95 % interval below zero) and passed the accuracy checks, and each
 # is bitwise with the path it replaces except those in NUMERICS_CHANGE_SLOTS. On a default
@@ -557,7 +559,7 @@ def built_slots(slots: dict, bound: dict, facts: Any) -> dict[str, bool]:
 def attn_qkv_a_built(attention: dict, widths) -> bool:
     """Slot attn_qkv_a serves a width: a layer's chain runs wqkv_a on the low-latency
     GEMM, which takes 1-8 rows."""
-    from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
+    mxfp8_ll = arch.kernels("mxfp8_ll")
 
     return any(w <= mxfp8_ll.MAX_ROWS for w in widths) and any(
         step.chain is not None and step.chain[0].qkv_a_ll for step in attention.values()
@@ -577,7 +579,8 @@ def build(model, ctx):
         PACKAGES,
         MegakernelDecode,
     )
-    from sgl_nvidia_mega.deepseek_v41.sm103.attention.swapab import CLUSTER_HEADS
+
+    CLUSTER_HEADS = arch.kernel_module("attention.swapab").CLUSTER_HEADS
 
     # benchmark-only switches: refused without simulated acceptance, before any build
     bench.setup()

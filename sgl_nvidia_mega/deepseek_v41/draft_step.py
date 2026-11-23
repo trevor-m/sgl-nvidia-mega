@@ -17,7 +17,13 @@ from types import SimpleNamespace
 
 import torch
 
-from sgl_nvidia_mega.deepseek_v41 import boundary, draft_attention, draft_slots, moe
+from sgl_nvidia_mega.deepseek_v41 import (
+    arch,
+    boundary,
+    draft_attention,
+    draft_slots,
+    moe,
+)
 from sgl_nvidia_mega.deepseek_v41 import plan as slot_plan
 from sgl_nvidia_mega.deepseek_v41.draft import DraftProposal
 from sgl_nvidia_mega.deepseek_v41.runtime import bench
@@ -468,7 +474,7 @@ def _wo_b_split(stages, kernels, hop):
     """Slot wo_b_publish_split on the draft: each stage whose wo_a is the fused kernel
     gets the split publisher on the draft hop's mailbox (its wo_b repacked here); raises
     when a stage's wo_b cannot be repacked (a load-time fact alike on every rank)."""
-    from sgl_nvidia_mega.deepseek_v41.sm103.runner import SplitPublisher
+    SplitPublisher = arch.kernel_module("runner").SplitPublisher
 
     split = SplitPublisher(hop.mailbox, "draft hop")
     for stage in stages:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import msgspec
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import arch
 from sgl_nvidia_mega.deepseek_v41.boundary.boundaries import Boundaries, BoundaryState
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
@@ -57,7 +58,7 @@ def _wo_b_split_default_takes(m, runtime) -> bool:
     shape the kernel takes."""
     import logging
 
-    from sgl_nvidia_mega.deepseek_v41.sm103.attention import wo_b_split
+    wo_b_split = arch.kernels("attention.wo_b_split")
 
     if not runtime.default_start():
         return True
@@ -133,7 +134,8 @@ def _build_hc_coeff(model, group) -> None:
 def _build_two_shot(model, ctx, group):
     """(the two-shot hops, "") or (None, why not); a failure on any rank raises
     on every rank."""
-    from sgl_nvidia_mega.deepseek_v41.sm103.two_shot_mhc import MAX_ROWS, TwoShotMHC
+    MAX_ROWS = arch.kernel_module("two_shot_mhc").MAX_ROWS
+    TwoShotMHC = arch.kernel_module("two_shot_mhc").TwoShotMHC
 
     cfg, m = model.config, model.model
     error, hop = "", None

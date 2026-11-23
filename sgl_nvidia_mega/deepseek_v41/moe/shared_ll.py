@@ -22,8 +22,10 @@ import logging
 
 import torch
 
-from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
-from sgl_nvidia_mega.deepseek_v41.sm103.attention.q_norm_quant import mxfp8_row_tiles
+from sgl_nvidia_mega.deepseek_v41 import arch
+
+mxfp8_ll = arch.kernels("mxfp8_ll")
+q_norm_quant = arch.kernels("attention.q_norm_quant")
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +181,7 @@ class SharedLL:
             device=self.weight.device,
         )
         for r in rows:
-            mxfp8_row_tiles(x[:r])
+            q_norm_quant.mxfp8_row_tiles(x[:r])
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """The shared expert's output for BF16 rows ``x``, on the current stream."""
@@ -187,7 +189,7 @@ class SharedLL:
 
         rows = x.shape[0]
         assert 0 < rows <= self.max_rows
-        x_q, x_s = mxfp8_row_tiles(x)
+        x_q, x_s = q_norm_quant.mxfp8_row_tiles(x)
         if self.fold is not None:
             return self.down_proj(self.fold(x_q, x_s))[0]
         gate_up = mxfp8_ll.linear(x_q, x_s, self.weight, self.weight_scale)
@@ -210,7 +212,7 @@ class SwigluFold:
         quant: bool,
         early_release: bool = False,
     ):
-        from sgl_nvidia_mega.deepseek_v41.sm103 import swiglu_ll
+        swiglu_ll = arch.kernels("swiglu_ll")
 
         self.weight, self.weight_scale = swiglu_ll.interleave_gate_up(
             weight, weight_scale

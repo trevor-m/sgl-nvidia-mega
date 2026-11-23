@@ -22,10 +22,12 @@ from typing import NamedTuple, Optional
 
 import torch
 
+from sgl_nvidia_mega.deepseek_v41 import arch
 from sgl_nvidia_mega.deepseek_v41.attention import chain
-from sgl_nvidia_mega.deepseek_v41.sm103 import mxfp8_ll
-from sgl_nvidia_mega.deepseek_v41.sm103.attention import core_lean
-from sgl_nvidia_mega.deepseek_v41.sm103.attention import wo_a as wo_a_kernel
+
+mxfp8_ll = arch.kernels("mxfp8_ll")
+core_lean = arch.kernels("attention.core_lean")
+wo_a_kernel = arch.kernels("attention.wo_a")
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
 SGLANG_READS = {
@@ -246,10 +248,8 @@ def build(stages, slots: frozenset[str]) -> dict[int, Kernels]:
 
 def precompile(stages, kernels: dict[int, Kernels], widths) -> None:
     """Compile the slots' kernels that do not depend on the KV pool, before capture."""
-    from sgl_nvidia_mega.deepseek_v41.sm103.attention import q_norm_gemm
-    from sgl_nvidia_mega.deepseek_v41.sm103.attention.q_norm_quant import (
-        rmsnorm_mxfp8,
-    )
+    q_norm_gemm = arch.kernels("attention.q_norm_gemm")
+    rmsnorm_mxfp8 = arch.kernel_module("attention.q_norm_quant").rmsnorm_mxfp8
 
     rows = [w for w in widths if w <= chain.NORM_QUANT_MAX_ROWS]
     ll_rows = [w for w in widths if w <= mxfp8_ll.MAX_ROWS]
