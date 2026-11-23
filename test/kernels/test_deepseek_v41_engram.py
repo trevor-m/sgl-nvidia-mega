@@ -140,7 +140,10 @@ def wkv():
 @needs_engram
 @pytest.mark.parametrize("tp", [4, 8], ids=["tp4", "tp8"])
 @pytest.mark.parametrize("rows", [1, 6, 16])
-def test_the_column_quarters_sum_to_sglangs_wkv(wkv, rows, tp):
+def test_the_prefetch_columns_give_sglangs_wkv(wkv, rows, tp):
+    """All the columns are SGLang's GEMM bit for bit; the zero-padded quarters sum to it
+    wherever each quarter is its columns bit for bit, which build checks before it picks
+    the quarters. Only Rubin's low-M split-K (by the output tiles) makes them differ."""
     from sglang.srt.layers.quantization.fp8_utils import (
         flashinfer_mxfp8_blockscaled_linear,
     )
@@ -156,19 +159,33 @@ def test_the_column_quarters_sum_to_sglangs_wkv(wkv, rows, tp):
         pin_tactic=True,
     )
     engram = SimpleNamespace(wkv=wkv)
+    whole = ep._Layer(engram, tp - 1, tp, whole=True)
+    assert (
+        whole.cols == slice(0, N) and whole.weight.data_ptr() == wkv.weight.data_ptr()
+    )
+    assert torch.equal(whole.quarter(emb).view(torch.int16), want.view(torch.int16))
     total = torch.zeros((rows, N), dtype=torch.float32, device="cuda")
+    bitwise = True
     for rank in range(tp):
         layer = ep._Layer(engram, rank, tp)
         assert (
             layer.weight.data_ptr() == wkv.weight[rank * N // tp].data_ptr()
         )  # a view
         # the side stream's zero-padded quarter, as gather sums it
+        quarter = layer.quarter(emb)
+        bitwise &= torch.equal(
+            quarter.view(torch.int16),
+            want[:, layer.cols].contiguous().view(torch.int16),
+        )
         padded = torch.zeros((rows, N), dtype=torch.bfloat16, device="cuda")
-        padded[:, layer.cols] = layer.quarter(emb)
+        padded[:, layer.cols] = quarter
         assert layer.cols == slice(rank * N // tp, (rank + 1) * N // tp)
         total += padded.float()
     torch.cuda.synchronize()
-    assert torch.equal(total.bfloat16(), want)
+    if bitwise:
+        assert torch.equal(total.bfloat16(), want)
+    else:
+        assert torch.cuda.get_device_capability() == (10, 7)
 
 
 # ----------------------------------------------------------------------- aux_mean_stats

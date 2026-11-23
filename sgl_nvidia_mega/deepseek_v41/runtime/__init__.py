@@ -336,6 +336,16 @@ def row_tile_layers(attention: dict, slots: frozenset) -> frozenset:
     )
 
 
+def _engram_built(prefetch) -> str:
+    """The summary's note on a built Engram prefetch."""
+    whole = getattr(prefetch, "whole_reason", "")
+    return (
+        f"built on all WKV columns ({whole}), checked bit for bit"
+        if whole
+        else ("built, checked bit for bit")
+    )
+
+
 def slot_reasons() -> list[str]:
     """Why the requested slots cannot be served ([] when they can)."""
     known = (*SHIPPED_SLOTS, *OPT_IN_SLOTS, *OPT_IN_COVERAGE)
@@ -774,7 +784,7 @@ def build(model, ctx):
         + f"hop A at {[w for w, x in slots.items() if x.hop_a]} rows, fast gate at "
         f"{[w for w, x in slots.items() if x.fast_gate]} rows, Engram prefetch at "
         f"{[w for w, x in slots.items() if x.engram_prefetch]} rows "
-        f"({engram.reason or 'built, checked bit for bit'}); boundary: "
+        f"({engram.reason or _engram_built(engram.prefetch)}); boundary: "
         f"{bound['boundary'].summary()}; weight copies "
         + str(
             {

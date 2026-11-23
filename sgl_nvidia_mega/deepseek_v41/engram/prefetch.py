@@ -153,26 +153,33 @@ def reason(engram, tp_size: int, table) -> str:
 
 
 class _Layer:
-    """One Engram layer's WKV quarter: this rank's output columns."""
+    """One Engram layer's WKV quarter: this rank's output columns (``whole``: all of
+    them, on SGLang's own weight and scale tensors)."""
 
-    def __init__(self, engram, rank: int, tp_size: int):
+    def __init__(self, engram, rank: int, tp_size: int, whole: bool = False):
         wkv = engram.wkv
         # detached: CuTe DSL's DLPack import refuses tensors that require grad
         weight = wkv.weight.detach()
         n = weight.size(0)
+        self.engram = engram
+        self.n = n
+        if whole:
+            self.weight = weight
+            self.scale = wkv.weight_scale_inv_swizzled
+            self.cols = slice(0, n)
+            return
         cols = n // tp_size
         start = rank * cols
         tiles = wkv.weight_scale_inv_swizzled.reshape(n // SCALE_TILE_ROWS, -1)
-        self.engram = engram
         self.weight = weight[start : start + cols]
         self.scale = tiles[
             start // SCALE_TILE_ROWS : (start + cols) // SCALE_TILE_ROWS
         ].reshape(-1)
         self.cols = slice(start, start + cols)
-        self.n = n
 
     def quarter(self, emb: torch.Tensor) -> torch.Tensor:
-        """This rank's columns of SGLang's ``wkv(emb)`` [rows, n / tp]."""
+        """This rank's columns of SGLang's ``wkv(emb)`` [rows, n / tp] (``whole``:
+        [rows, n])."""
         from sglang.srt.layers.quantization.fp8_utils import (
             flashinfer_mxfp8_blockscaled_linear,
         )
@@ -191,13 +198,29 @@ class EngramPrefetch:
     """The side stream, its persistent buffers and the two main-stream points."""
 
     exchange = None  # slot engram_publish: the mailbox exchange
+    whole = False  # every rank runs all the WKV columns
+    # why every rank runs all the WKV columns ("": the quarters), for the summary
+    whole_reason = ""
 
-    def __init__(self, engrams: dict, group, first_layer: int, deadline_s: float = 0.0):
-        """``deadline_s`` > 0: slot engram_publish, the exchange with that wait deadline."""
+    def __init__(
+        self,
+        engrams: dict,
+        group,
+        first_layer: int,
+        deadline_s: float = 0.0,
+        whole: bool = False,
+    ):
+        """``deadline_s`` > 0: slot engram_publish, the exchange with that wait deadline.
+        ``whole``: every rank runs all the WKV columns (no exchange, no gather sum)."""
+        if whole and deadline_s > 0:
+            raise ValueError("the mailbox exchange publishes column quarters")
         rank, tp_size = group.rank_in_group, group.world_size
         self.group = group
+        self.whole = whole
         self.stream = torch.cuda.Stream()
-        self.layers = {i: _Layer(e, rank, tp_size) for i, e in sorted(engrams.items())}
+        self.layers = {
+            i: _Layer(e, rank, tp_size, whole) for i, e in sorted(engrams.items())
+        }
         self.index = {i: j for j, i in enumerate(self.layers)}
         self.reduce_at, self.gather_at = first_layer - 1, first_layer
         first = next(iter(self.layers.values()))
@@ -294,7 +317,8 @@ class EngramPrefetch:
         parts = self._parts(self.rows)
         with torch.cuda.stream(self.stream):
             self.stream.wait_event(self.reduced)
-            parts.zero_()
+            if not self.whole:
+                parts.zero_()
             for j, layer in enumerate(self.layers.values()):
                 parts[j, :, layer.cols] = layer.quarter(emb[j])
             self.wkv_done.record(self.stream)
@@ -328,10 +352,13 @@ class EngramPrefetch:
 
     def gather(self) -> None:
         """Main stream at ``gather_at``: the zero-padded quarters summed into every
-        layer's rows (this also joins the side stream)."""
+        layer's rows (this also joins the side stream); ``whole``: the side stream's
+        rows as they are (the next step's side stream writes them only after its
+        ``reduce``, which the main stream reaches after this step's last gate)."""
         torch.cuda.current_stream().wait_event(self.wkv_done)
         self._emb = None  # the side stream's reads of it are now ordered before main
-        self.kv = self.group.all_reduce(self._parts(self.rows))
+        parts = self._parts(self.rows)
+        self.kv = parts if self.whole else self.group.all_reduce(parts)
 
     def gate(self, layer_id: int, x: torch.Tensor) -> torch.Tensor:
         """``Engram.forward(x, ...)`` of layer ``layer_id`` from its gathered rows."""
@@ -388,6 +415,26 @@ def _hash_ids(w: int, cols: int, ranges: list) -> torch.Tensor:
     return out
 
 
+def _quarter_mismatch(prefetch, ids: dict) -> str:
+    """ "" when each layer's WKV quarter on this rank is the same columns of SGLang's
+    whole GEMM bit for bit at every width, else the first that is not. SGLang's lookup
+    is a collective: every rank runs every width and layer, in the same order."""
+    mismatch = ""
+    for w, hash_ids in ids.items():
+        for i, layer in prefetch.layers.items():
+            e = layer.engram
+            emb = e.embed(hash_ids[:, e.layer_hash_index])
+            want, _ = e.wkv(emb.flatten(-2))
+            got = layer.quarter(emb)
+            same = torch.equal(
+                got.view(torch.int16),
+                want[:, layer.cols].contiguous().view(torch.int16),
+            )
+            if not mismatch and not same:
+                mismatch = f"layer {i} at {w} rows"
+    return mismatch
+
+
 def build(model, ctx, group, publish: bool = False):
     """The Engram prefetch, or None, and the reason it is off (``publish``: slot
     engram_publish, the mailbox exchange). Build runs it at every
@@ -438,7 +485,24 @@ def build(model, ctx, group, publish: bool = False):
     error = _any_error(group, error)
     if error:
         return None, error
-    if publish:
+    # A rank's quarter sums K in SGLang's order only where FlashInfer runs the quarter's
+    # N as it runs the whole N (module docstring); where any rank's does not, every
+    # rank runs all the columns
+    whole = _any_error(group, _quarter_mismatch(prefetch, ids))
+    if whole:
+        try:
+            prefetch = EngramPrefetch(engrams, group, first_layer, whole=True)
+            prefetch.whole_reason = (
+                "a WKV column quarter is not SGLang's GEMM bit for bit: "
+                + whole.split(";")[0]
+            )
+            error = ""
+        except Exception as e:  # gathered: the slot is then off on every rank
+            error = f"{type(e).__name__}: {e}"
+        error = _any_error(group, error)
+        if error:
+            return None, error
+    elif publish:
         # collective (the mailboxes' rendezvous): every rank reaches it or none does
         prefetch = EngramPrefetch(engrams, group, first_layer, ctx.deadline_s)
     # every collective below runs on the main stream, in the same order on every
@@ -451,11 +515,12 @@ def build(model, ctx, group, publish: bool = False):
             e = layer.engram
             want, _ = e.wkv(e.embed(ids[w][:, e.layer_hash_index]).flatten(-2))
             got = rows[i]
-            # the exchange copies bits: compare them (the all-reduce's sum with zeros
-            # turns a -0.0 into +0.0, so its rows compare by value)
+            # the exchange and the whole columns copy bits: compare them (the
+            # all-reduce's sum with zeros turns a -0.0 into +0.0, so its rows compare
+            # by value)
             same = (
                 torch.equal(got.view(torch.int16), want.view(torch.int16))
-                if prefetch.exchange is not None
+                if prefetch.exchange is not None or prefetch.whole
                 else torch.equal(got, want)
             )
             if not mismatch and not same:
