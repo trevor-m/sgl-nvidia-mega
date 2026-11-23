@@ -125,19 +125,35 @@ def resident_blocks() -> int:
     return 148 if "sm148" in SLOTS else 152
 
 
-# (tp_size, ep_size) served: TP4 on one GB300 tray; attention TP8 + MoE TP4 x EP2 on
-# two trays of one NVLink domain (MoE-TP groups ranks 0-3 and 4-7, EP pairs i, i + 4)
-TOPOLOGIES = frozenset({(4, 1), (8, 2)})
+# (tp_size, ep_size) served: TP4 on one tray; attention TP8 + MoE TP4 x EP2 on two
+# trays of one NVLink domain (MoE-TP groups ranks 0-3 and 4-7, EP pairs i, i + 4); on
+# Rubin also attention TP8 + MoE TP8 (no expert parallelism), whose routed pair runs
+# the 288-wide TP8 expert slice (sm107/moe/routed_expert_gemm.py EXPERT_SHAPES)
+TOPOLOGIES_BY_DIRECTORY = {
+    "sm103": frozenset({(4, 1), (8, 2)}),
+    "sm107": frozenset({(4, 1), (8, 1), (8, 2)}),
+}
+TOPOLOGIES = frozenset().union(*TOPOLOGIES_BY_DIRECTORY.values())
+_SERVED = {
+    (4, 1): "TP4 without expert parallelism",
+    (8, 1): "TP8 with ep_size 1 (MoE TP8)",
+    (8, 2): "TP8 with ep_size 2 (MoE TP4 x EP2)",
+}
 
 
 def topology_reasons(cfg) -> list[str]:
-    """Why the server's parallel layout is not one of ``TOPOLOGIES`` ([] when it is)."""
+    """Why the server's parallel layout is not one the kernel directory serves
+    (``TOPOLOGIES_BY_DIRECTORY``; [] when it is)."""
+    from sgl_nvidia_mega.deepseek_v41 import arch
+
     tp, ep = cfg.tp_size, cfg.ep_size or 1
+    directory = arch.directory()
+    served = TOPOLOGIES_BY_DIRECTORY[directory]
     reasons = []
-    if (tp, ep) not in TOPOLOGIES:
+    if (tp, ep) not in served:
         reasons.append(
-            f"tp_size {tp} with ep_size {ep}: DeepSeek-V4.1 serves TP4 without expert "
-            "parallelism, or TP8 with ep_size 2 (MoE TP4 x EP2)"
+            f"tp_size {tp} with ep_size {ep}: DeepSeek-V4.1 on {directory} serves "
+            + ", or ".join(_SERVED[t] for t in sorted(served))
         )
     if tp == 4 and cfg.nnodes > 1:
         reasons.append(f"TP4 serves one tray; nnodes is {cfg.nnodes}")
@@ -381,7 +397,7 @@ def _build(model, hf_config, ctx):
 SPEC = MegakernelSpec(
     name="DeepSeek-V4.1",
     requires=REQUIREMENTS,
-    # TP8 spans two trays; its MoE runs TP4 x EP2 (topology_reasons admits only that)
+    # TP8 spans two trays; its MoE runs TP4 x EP2, or on Rubin TP8 (topology_reasons)
     features=frozenset(
         {
             Feature.SPECULATIVE_DECODING,

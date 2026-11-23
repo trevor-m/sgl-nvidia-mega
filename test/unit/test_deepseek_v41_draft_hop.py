@@ -36,7 +36,7 @@ def _stage(layer_id, top_k=3):
 
 @pytest.mark.parametrize(
     "tp, ep, served",
-    [(4, 1, False), (2, 1, False), (8, 2, True), (8, 1, False), (16, 2, False)],
+    [(4, 1, False), (2, 1, False), (8, 2, True), (8, 1, True), (16, 2, False)],
 )
 def test_the_hop_serves_only_where_sglang_has_no_fused_post(tp, ep, served):
     with mock.patch(PARALLEL, return_value=_parallel(tp, ep)):

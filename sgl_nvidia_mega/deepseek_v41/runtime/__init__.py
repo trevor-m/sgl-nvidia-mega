@@ -117,7 +117,7 @@ SHIPPED_SLOTS = (
     "draft_gate",
     "draft_tail",
     "draft_post",
-    # draft_hop: at attention TP8 with MoE TP4 x EP2, where SGLang has no fused post,
+    # draft_hop: at attention TP8 (MoE TP4 x EP2 or MoE TP8), where SGLang has no fused post,
     # draft_post's posts on the plugin's Lamport all-reduce + mHC (no effect at TP4)
     "draft_hop",
     "draft_seam",

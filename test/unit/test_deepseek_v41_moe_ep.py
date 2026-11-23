@@ -136,10 +136,13 @@ def _boundary_layer(sglang_fuses: bool, *, shared_tp1=False):
         (4, 1, False, False, False),
         (8, 2, False, False, True),  # TP8 + EP2: SGLang's gate less its TP list
         (8, 2, False, True, False),  # a replicated shared expert keeps it off
-        (8, 1, False, False, False),
+        (8, 1, False, False, True),  # TP8 + MoE TP8 (Rubin's TP8 c1): the same gate
+        (8, 1, False, True, False),
+        (8, 4, False, False, False),
+        (16, 2, False, False, False),
     ],
 )
-def test_the_post_gate_admits_tp8_ep2_only(tp, ep, sglang_fuses, shared_tp1, want):
+def test_the_post_gate_admits_tp8_ep2_and_ep1(tp, ep, sglang_fuses, shared_tp1, want):
     from sgl_nvidia_mega.deepseek_v41.boundary import boundaries
 
     parallel = SimpleNamespace(tp_size=tp, moe_ep_size=ep)

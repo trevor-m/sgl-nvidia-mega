@@ -30,7 +30,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.server_args import ServerArgs
 
 from sgl_nvidia_mega import plugin
-from sgl_nvidia_mega.deepseek_v41 import HF_CONFIG, spec
+from sgl_nvidia_mega.deepseek_v41 import HF_CONFIG, arch, spec
 
 DOCUMENTED = dict(
     model_path="dummy",
@@ -54,6 +54,12 @@ def registered(monkeypatch):
     monkeypatch.setattr(registry, "_REGISTRY", {})
     monkeypatch.delenv(plugin.PARITY_SORT_ENV, raising=False)
     plugin.register()
+
+
+@pytest.fixture(autouse=True)
+def _directory_per_test(monkeypatch):
+    """The kernel directory (cached per process) follows each test's patched ISA."""
+    monkeypatch.setattr(arch, "_chosen", None)
 
 
 def _refusal(hf=None, dtype="bfloat16", isa="sm_103", env=None, **args) -> str:
@@ -170,14 +176,36 @@ def test_a_replicated_shared_expert_is_refused():
     assert "SGLANG_SHARED_EXPERT_TP1" in message, message
 
 
-def test_the_topology_table_is_tp4_and_tp8_ep2():
-    assert spec.TOPOLOGIES == {(4, 1), (8, 2)}
+@pytest.mark.parametrize(
+    "directory, served",
+    [("sm103", {(4, 1), (8, 2)}), ("sm107", {(4, 1), (8, 1), (8, 2)})],
+)
+def test_the_topology_table_is_per_kernel_directory(monkeypatch, directory, served):
+    """Rubin's routed pair also runs the TP8 expert slice, so sm107 serves MoE TP8."""
+    assert spec.TOPOLOGIES_BY_DIRECTORY[directory] == served
+    assert spec.TOPOLOGIES == {(4, 1), (8, 1), (8, 2)}
     assert spec.REQUIREMENTS.tp_sizes == {4, 8}
-    for tp, ep in [(4, 1), (8, 2)]:
+    monkeypatch.setattr(arch, "_chosen", directory)
+    for tp, ep in served:
         cfg = SimpleNamespace(tp_size=tp, ep_size=ep, nnodes=tp // 4, moe_dp_size=1)
         assert spec.topology_reasons(cfg) == []
     cfg = SimpleNamespace(tp_size=8, ep_size=2, nnodes=2, moe_dp_size=2)
     assert spec.topology_reasons(cfg) == ["moe_dp_size 2 is not 1"]
+    if (8, 1) not in served:
+        cfg = SimpleNamespace(tp_size=8, ep_size=1, nnodes=2, moe_dp_size=1)
+        (reason,) = spec.topology_reasons(cfg)
+        assert reason.startswith(
+            f"tp_size 8 with ep_size 1: DeepSeek-V4.1 on {directory}"
+        )
+
+
+# attention TP8 + MoE TP8 over two Rubin trays (the TP8 c1 layout)
+TP8_EP1 = dict(tp_size=8, nnodes=2, node_rank=0, dist_init_addr="127.0.0.1:5000")
+
+
+def test_tp8_with_ep1_is_accepted_on_rubin_only():
+    assert _refusal(isa="sm_107", **TP8_EP1) == ""
+    assert "tp_size 8 with ep_size 1" in _refusal(isa="sm_103", **TP8_EP1)
 
 
 DISABLED = with_phase(

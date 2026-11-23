@@ -521,11 +521,11 @@ class Boundaries:
 
         # past SGLang's fused collective its FFN combine norms the streams itself;
         # the streams match, the in-kernel norm can differ from it by an ULP. At TP8
-        # with EP2 SGLang has no fused collective at all (its combine always norms),
-        # so the kernel's norm stands in for that launch, as hop A's does
+        # (EP2 or EP1) SGLang has no fused collective at all (its combine always
+        # norms), so the kernel's norm stands in for that launch, as hop A's does
         if not (
             can_fuse_all_reduce(partial.shape[0], layer.hc_cfg.hidden)
-            or _tp8_ep2_fusable(layer, "attn")
+            or _tp8_fusable(layer, "attn")
         ):
             return mhc.HcState(updated, pre)
         return mhc.HcState(updated, pre, mhc.HcNormed(normed))
@@ -652,29 +652,36 @@ def _quantizes(nxt, rows: int) -> bool:
     return nxt.accepts_mxfp8 and nxt.norm_fusable and rows <= SGLANG_QUANT_MAX_ROWS
 
 
+# The TP8 layouts whose posts SGLang leaves unfused (its fused all-reduce + mHC kernels
+# are TP2 / TP4 only) and the plugin's hops serve: MoE TP4 x EP2, and MoE TP8 (EP1)
+TP8_LAYOUTS = frozenset({(8, 1), (8, 2)})
+
+
 def _fusable(layer, kind: str, fuses: bool) -> bool:
     """The static half of SGLang's fusion gate (load-time facts of the layer); at TP8
-    (MoE TP4 x EP2), where SGLang has no fused all-reduce + mHC kernels, the same
-    gate without its world-size check, so the plugin's own hops serve the posts."""
+    (MoE TP4 x EP2 or MoE TP8), where SGLang has no fused all-reduce + mHC kernels,
+    the same gate without its world-size check, so the plugin's own hops serve the
+    posts."""
     fusable = layer._can_fuse_attn_mhc if _attention(kind) else layer._can_fuse_ffn_mhc
     return (
         fuses
         and layer.boundary_pre_from_prev
-        and (fusable or _tp8_ep2_fusable(layer, kind))
+        and (fusable or _tp8_fusable(layer, kind))
     )
 
 
-def _tp8_ep2_fusable(layer, kind: str) -> bool:
-    """SGLang's ``_can_fuse_attn_mhc`` / ``_can_fuse_ffn_mhc`` at TP8 with EP2, less
-    ``fused_mhc_tp_ok`` (TP2 / TP4 only): the EP and MoE-TP sums merge into one TP
-    all-reduce (moe_dp_size 1), which the hops run over the 8 ranks."""
+def _tp8_fusable(layer, kind: str) -> bool:
+    """SGLang's ``_can_fuse_attn_mhc`` / ``_can_fuse_ffn_mhc`` at TP8 (``TP8_LAYOUTS``),
+    less ``fused_mhc_tp_ok`` (TP2 / TP4 only): with EP2 the EP and MoE-TP sums merge
+    into one TP all-reduce (moe_dp_size 1), with EP1 the MoE-TP sum is that all-reduce;
+    the hops run it over the 8 ranks."""
     from sglang.srt.layers.moe import get_moe_a2a_backend
     from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
     from sglang.srt.models import deepseek_v4_mhc as mhc
     from sglang.srt.runtime_context import get_parallel
 
     parallel = get_parallel()
-    if (parallel.tp_size, parallel.moe_ep_size) != (8, 2):
+    if (parallel.tp_size, parallel.moe_ep_size) not in TP8_LAYOUTS:
         return False
     if _attention(kind):
         boundary = mhc.make_boundary(

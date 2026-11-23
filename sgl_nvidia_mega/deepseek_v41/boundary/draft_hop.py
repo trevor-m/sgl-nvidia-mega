@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Slot draft_hop: the DSpark draft stages' posts on the plugin's Lamport all-reduce +
-mHC where SGLang has no fused post (attention TP8, MoE TP4 x EP2).
+mHC where SGLang has no fused post (attention TP8; MoE TP4 x EP2 or MoE TP8).
 
 At TP2 / TP4 slot draft_post runs SGLang's fused all-reduce + mHC kernels on the
 stages. SGLang builds those for TP2 / TP4 only (``deepseek_v4_mhc._FUSED_MHC_TP_SIZES``),
@@ -30,8 +30,9 @@ SGLANG_READS = {
     "srt/runtime_context.py": ("get_parallel", '"tp_size"', '"moe_ep_size"'),
 }
 
-# The layout whose draft posts SGLang leaves unfused and this hop serves
-LAYOUT = (8, 2)
+# The layouts whose draft posts SGLang leaves unfused and this hop serves (TP8 with
+# MoE TP4 x EP2, or with MoE TP8)
+LAYOUTS = frozenset({(8, 1), (8, 2)})
 
 
 class DraftHop:
@@ -77,7 +78,7 @@ def layout_reason() -> str:
     tp = parallel.tp_size
     if sglang_fuses():
         return f"SGLang's fused all-reduce + mHC posts serve at TP{tp}"
-    if (tp, parallel.moe_ep_size) != LAYOUT:
+    if (tp, parallel.moe_ep_size) not in LAYOUTS:
         return f"no fused post at (tp, ep) = ({tp}, {parallel.moe_ep_size})"
     return ""
 
@@ -85,7 +86,7 @@ def layout_reason() -> str:
 def build(
     stages, *, deadline_s: float, max_rows: int, final_collapse: bool = False
 ) -> tuple[Optional[DraftHop], str]:
-    """(the hop, "") or (None, why not). Collective over the TP group at (8, 2): a
+    """(the hop, "") or (None, why not). Collective over the TP group at TP8: a
     failure on any rank raises on every rank."""
     from sglang.srt.runtime_context import get_parallel
 

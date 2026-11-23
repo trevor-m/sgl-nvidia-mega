@@ -119,7 +119,7 @@ class DraftDecode(DraftProposal):
                 **moe.gemm2_options(slots),
             )
         # slot draft_hop: the posts on the plugin's Lamport hop where SGLang has no
-        # fused post (TP8 with EP2)
+        # fused post (TP8, with EP2 or EP1)
         hop, self._hop_reason = None, "not requested"
         if "draft_post" in slots and "draft_hop" in slots:
             from sgl_nvidia_mega.deepseek_v41.boundary import draft_hop
